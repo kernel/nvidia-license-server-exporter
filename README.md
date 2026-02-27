@@ -28,6 +28,8 @@ Optional:
 - `CACHE_TTL` (optional, default `60s`)
 - `PARALLELISM` (optional, default `8`)
 
+If `LISTEN_ADDRESS` is unset and `PORT` is set (for example on Railway), the exporter listens on `:$PORT`.
+
 ### OTEL push (optional)
 
 - `OTEL_ENABLED` (optional, default `false`)

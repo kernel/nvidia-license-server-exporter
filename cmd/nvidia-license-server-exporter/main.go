@@ -25,7 +25,7 @@ import (
 
 func main() {
 	var (
-		listenAddress = flag.String("listen-address", getenv("LISTEN_ADDRESS", ":9844"), "Address to listen on for HTTP requests.")
+		listenAddress = flag.String("listen-address", defaultListenAddress(), "Address to listen on for HTTP requests.")
 		metricsPath   = flag.String("metrics-path", getenv("METRICS_PATH", "/metrics"), "Path where metrics are exposed.")
 		baseURL       = flag.String("nvidia-api-base-url", getenv("NVIDIA_API_BASE_URL", "https://api.licensing.nvidia.com"), "NVIDIA CLS API base URL.")
 		orgName       = flag.String("nvidia-org-name", firstNonEmpty(getenv("NVIDIA_ORG_NAME", ""), getenv("NLS_ORG_NAME", "")), "NVIDIA org name / ID (e.g. lic-...).")
@@ -199,4 +199,20 @@ func firstNonEmpty(values ...string) string {
 		}
 	}
 	return ""
+}
+
+func defaultListenAddress() string {
+	if v := strings.TrimSpace(os.Getenv("LISTEN_ADDRESS")); v != "" {
+		return v
+	}
+
+	port := strings.TrimSpace(os.Getenv("PORT"))
+	if port != "" {
+		if strings.HasPrefix(port, ":") {
+			return port
+		}
+		return ":" + port
+	}
+
+	return ":9844"
 }

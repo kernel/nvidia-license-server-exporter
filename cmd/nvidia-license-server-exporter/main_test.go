@@ -39,3 +39,37 @@ func TestFirstNonEmpty(t *testing.T) {
 		t.Fatalf("expected first non-empty value, got %q", got)
 	}
 }
+
+func TestDefaultListenAddress(t *testing.T) {
+	t.Run("uses LISTEN_ADDRESS when set", func(t *testing.T) {
+		t.Setenv("LISTEN_ADDRESS", ":7777")
+		t.Setenv("PORT", "9999")
+		if got := defaultListenAddress(); got != ":7777" {
+			t.Fatalf("expected LISTEN_ADDRESS to win, got %q", got)
+		}
+	})
+
+	t.Run("uses PORT when LISTEN_ADDRESS missing", func(t *testing.T) {
+		t.Setenv("LISTEN_ADDRESS", "")
+		t.Setenv("PORT", "8080")
+		if got := defaultListenAddress(); got != ":8080" {
+			t.Fatalf("expected :8080, got %q", got)
+		}
+	})
+
+	t.Run("accepts PORT with leading colon", func(t *testing.T) {
+		t.Setenv("LISTEN_ADDRESS", "")
+		t.Setenv("PORT", ":9090")
+		if got := defaultListenAddress(); got != ":9090" {
+			t.Fatalf("expected :9090, got %q", got)
+		}
+	})
+
+	t.Run("falls back to default", func(t *testing.T) {
+		t.Setenv("LISTEN_ADDRESS", "")
+		t.Setenv("PORT", "")
+		if got := defaultListenAddress(); got != ":9844" {
+			t.Fatalf("expected default :9844, got %q", got)
+		}
+	})
+}
