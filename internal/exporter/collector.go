@@ -2,24 +2,17 @@ package exporter
 
 import (
 	"context"
-	"log"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
-	"nvidia-license-server-exporter/internal/cls"
+	"nvidia-license-server-exporter/internal/snapshot"
 )
 
-const defaultCacheTTL = 60 * time.Second
-
 type Collector struct {
-	client        *cls.Client
+	snapshotSvc   *snapshot.Service
 	scrapeTimeout time.Duration
-	cacheTTL      time.Duration
-
-	mu sync.Mutex
 
 	upDesc                  *prometheus.Desc
 	scrapeDurationDesc      *prometheus.Desc
@@ -30,23 +23,14 @@ type Collector struct {
 	serverFeatureActiveDesc *prometheus.Desc
 
 	descs []*prometheus.Desc
-
-	cachedSnapshot *cls.Snapshot
-	cachedAt       time.Time
 }
 
-func NewCollector(client *cls.Client, scrapeTimeout, cacheTTL time.Duration) *Collector {
-	if cacheTTL <= 0 {
-		cacheTTL = defaultCacheTTL
-	}
-
-	org := client.OrgName()
-	constLabel := prometheus.Labels{"org_name": org}
+func NewCollector(snapshotSvc *snapshot.Service, orgName string, scrapeTimeout time.Duration) *Collector {
+	constLabel := prometheus.Labels{"org_name": orgName}
 
 	c := &Collector{
-		client:        client,
+		snapshotSvc:   snapshotSvc,
 		scrapeTimeout: scrapeTimeout,
-		cacheTTL:      cacheTTL,
 
 		upDesc: prometheus.NewDesc(
 			"nvidia_cls_up",
@@ -112,47 +96,23 @@ func (c *Collector) Describe(ch chan<- *prometheus.Desc) {
 }
 
 func (c *Collector) Collect(ch chan<- prometheus.Metric) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	ctx, cancel := context.WithTimeout(context.Background(), c.scrapeTimeout)
+	defer cancel()
 
-	var (
-		snapshot *cls.Snapshot
-		err      error
-		duration float64
-	)
-
-	now := time.Now()
-	cacheHit := c.cachedSnapshot != nil && now.Sub(c.cachedAt) < c.cacheTTL
-	if cacheHit {
-		snapshot = c.cachedSnapshot
-		duration = 0
-	} else {
-		start := time.Now()
-		ctx, cancel := context.WithTimeout(context.Background(), c.scrapeTimeout)
-		snapshot, err = c.client.FetchSnapshot(ctx)
-		cancel()
-		duration = time.Since(start).Seconds()
-		if err == nil {
-			c.cachedSnapshot = snapshot
-			c.cachedAt = time.Now()
-		}
-	}
-
+	snapshot, meta, err := c.snapshotSvc.Get(ctx)
 	if err != nil {
-		log.Printf("scrape failed: %v", err)
-		if c.cachedSnapshot == nil {
-			ch <- prometheus.MustNewConstMetric(c.upDesc, prometheus.GaugeValue, 0)
-			ch <- prometheus.MustNewConstMetric(c.scrapeDurationDesc, prometheus.GaugeValue, duration)
-			return
-		}
-		snapshot = c.cachedSnapshot
+		lastMeta := c.snapshotSvc.Meta()
 		ch <- prometheus.MustNewConstMetric(c.upDesc, prometheus.GaugeValue, 0)
-	} else {
-		ch <- prometheus.MustNewConstMetric(c.upDesc, prometheus.GaugeValue, 1)
+		ch <- prometheus.MustNewConstMetric(c.scrapeDurationDesc, prometheus.GaugeValue, lastMeta.DurationSeconds)
+		if !lastMeta.Timestamp.IsZero() {
+			ch <- prometheus.MustNewConstMetric(c.scrapeTimestampDesc, prometheus.GaugeValue, float64(lastMeta.Timestamp.Unix()))
+		}
+		return
 	}
 
-	ch <- prometheus.MustNewConstMetric(c.scrapeDurationDesc, prometheus.GaugeValue, duration)
-	ch <- prometheus.MustNewConstMetric(c.scrapeTimestampDesc, prometheus.GaugeValue, float64(snapshot.CollectedAt.Unix()))
+	ch <- prometheus.MustNewConstMetric(c.upDesc, prometheus.GaugeValue, meta.Up)
+	ch <- prometheus.MustNewConstMetric(c.scrapeDurationDesc, prometheus.GaugeValue, meta.DurationSeconds)
+	ch <- prometheus.MustNewConstMetric(c.scrapeTimestampDesc, prometheus.GaugeValue, float64(meta.Timestamp.Unix()))
 
 	for _, item := range snapshot.EntitlementFeatures {
 		labels := []string{

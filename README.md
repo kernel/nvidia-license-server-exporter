@@ -1,11 +1,8 @@
 # nvidia-license-server-exporter
 
-A Prometheus exporter for NVIDIA Cloud License Service (CLS).
-
-It collects:
-- Virtual group entitlement totals (`total`)
-- Per-server feature capacity and active lease counts
-- License server metadata (`info`)
+A NVIDIA Cloud License Service (CLS) exporter with:
+- Prometheus pull (`/metrics`)
+- Optional OTEL metrics push (OTLP gRPC)
 
 The exporter is intentionally scoped to CLS only (no DLS support).
 
@@ -19,7 +16,7 @@ Optional:
 
 ## Configuration
 
-Environment variables:
+### CLS and server
 
 - `NVIDIA_API_KEY` (required)
 - `NVIDIA_ORG_NAME` (required)
@@ -31,7 +28,16 @@ Environment variables:
 - `CACHE_TTL` (optional, default `60s`)
 - `PARALLELISM` (optional, default `8`)
 
-Flags are also available with the same names in `-kebab-case`, e.g. `-nvidia-org-name`.
+### OTEL push (optional)
+
+- `OTEL_ENABLED` (optional, default `false`)
+- `OTEL_ENDPOINT` (optional, default `127.0.0.1:4317`)
+- `OTEL_SERVICE_NAME` (optional, default `nvidia-license-server-exporter`)
+- `OTEL_SERVICE_INSTANCE_ID` (optional, default hostname)
+- `OTEL_INSECURE` (optional, default `true`)
+- `OTEL_PUSH_INTERVAL` (optional, default `60s`)
+
+Flags are also available in `-kebab-case` (for example `-otel-enabled`, `-otel-endpoint`).
 
 ## Run
 
@@ -46,6 +52,18 @@ Endpoints:
 
 - `GET /metrics`
 - `GET /healthz`
+
+## Shared cache behavior
+
+Prometheus pull and OTEL push use the same snapshot cache.
+
+- If cache is fresh (`CACHE_TTL`), no CLS API call is made.
+- If cache is stale, one refresh call updates cache for both pull and push.
+- If refresh fails and a stale snapshot exists, stale data is still emitted with `nvidia_cls_up=0`.
+
+Recommended default:
+- `CACHE_TTL=60s`
+- `OTEL_PUSH_INTERVAL=60s`
 
 ## Exported metrics
 

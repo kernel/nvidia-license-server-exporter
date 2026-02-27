@@ -1,12 +1,17 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
+	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -14,6 +19,8 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"nvidia-license-server-exporter/internal/cls"
 	"nvidia-license-server-exporter/internal/exporter"
+	"nvidia-license-server-exporter/internal/otel"
+	"nvidia-license-server-exporter/internal/snapshot"
 )
 
 func main() {
@@ -27,6 +34,12 @@ func main() {
 		scrapeTimeout = flag.Duration("scrape-timeout", durationFromEnv("SCRAPE_TIMEOUT", 20*time.Second), "Timeout for each CLS scrape.")
 		cacheTTL      = flag.Duration("cache-ttl", durationFromEnv("CACHE_TTL", 60*time.Second), "In-memory cache TTL for CLS snapshots.")
 		parallelism   = flag.Int("parallelism", intFromEnv("PARALLELISM", 8), "Max concurrent CLS API calls during scrape.")
+		otelEnabled   = flag.Bool("otel-enabled", boolFromEnv("OTEL_ENABLED", false), "Enable OTEL metrics export.")
+		otelEndpoint  = flag.String("otel-endpoint", getenv("OTEL_ENDPOINT", "127.0.0.1:4317"), "OTLP gRPC endpoint.")
+		otelSvcName   = flag.String("otel-service-name", getenv("OTEL_SERVICE_NAME", "nvidia-license-server-exporter"), "OTEL service.name.")
+		otelSvcID     = flag.String("otel-service-instance-id", getenv("OTEL_SERVICE_INSTANCE_ID", hostnameOrUnknown()), "OTEL service.instance.id.")
+		otelInsecure  = flag.Bool("otel-insecure", boolFromEnv("OTEL_INSECURE", true), "Disable TLS for OTLP.")
+		otelInterval  = flag.Duration("otel-push-interval", durationFromEnv("OTEL_PUSH_INTERVAL", 60*time.Second), "OTEL periodic push interval.")
 	)
 	flag.Parse()
 
@@ -48,11 +61,13 @@ func main() {
 		log.Fatalf("failed to create CLS client: %v", err)
 	}
 
+	snapshotSvc := snapshot.NewService(client, *cacheTTL)
+
 	registry := prometheus.NewRegistry()
 	registry.MustRegister(
 		collectors.NewGoCollector(),
 		collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),
-		exporter.NewCollector(client, *scrapeTimeout, *cacheTTL),
+		exporter.NewCollector(snapshotSvc, *orgName, *scrapeTimeout),
 	)
 
 	mux := http.NewServeMux()
@@ -66,11 +81,61 @@ func main() {
 		_, _ = fmt.Fprintf(w, "nvidia-license-server-exporter\nscrape metrics at %s\n", *metricsPath)
 	})
 
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	var otelPusher *otel.MetricsPusher
+	if *otelEnabled {
+		pusher, initErr := otel.NewMetricsPusher(ctx, otel.Config{
+			Enabled:           *otelEnabled,
+			Endpoint:          *otelEndpoint,
+			ServiceName:       *otelSvcName,
+			ServiceInstanceID: *otelSvcID,
+			Insecure:          *otelInsecure,
+			PushInterval:      *otelInterval,
+			RefreshTimeout:    *scrapeTimeout,
+		}, *orgName, snapshotSvc)
+		if initErr != nil {
+			log.Fatalf("failed to initialize otel metrics: %v", initErr)
+		}
+		otelPusher = pusher
+		otelPusher.Start()
+		log.Printf("otel enabled endpoint=%s insecure=%t interval=%s", *otelEndpoint, *otelInsecure, otelInterval.String())
+	}
+
+	server := &http.Server{
+		Addr:    *listenAddress,
+		Handler: mux,
+	}
+
 	log.Printf("starting nvidia-license-server-exporter on %s", *listenAddress)
 	log.Printf("scraping org=%s base_url=%s", *orgName, *baseURL)
 	log.Printf("cache_ttl=%s", cacheTTL.String())
-	if err := http.ListenAndServe(*listenAddress, mux); err != nil {
-		log.Fatal(err)
+
+	serverErr := make(chan error, 1)
+	go func() {
+		serverErr <- server.ListenAndServe()
+	}()
+
+	select {
+	case err := <-serverErr:
+		if !errors.Is(err, http.ErrServerClosed) {
+			log.Fatalf("server failed: %v", err)
+		}
+	case <-ctx.Done():
+		log.Printf("shutdown signal received")
+	}
+
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	if otelPusher != nil {
+		if err := otelPusher.Shutdown(shutdownCtx); err != nil {
+			log.Printf("otel shutdown error: %v", err)
+		}
+	}
+	if err := server.Shutdown(shutdownCtx); err != nil {
+		log.Printf("http shutdown error: %v", err)
 	}
 }
 
@@ -95,6 +160,18 @@ func intFromEnv(key string, fallback int) int {
 	return value
 }
 
+func boolFromEnv(key string, fallback bool) bool {
+	raw := strings.TrimSpace(os.Getenv(key))
+	if raw == "" {
+		return fallback
+	}
+	value, err := strconv.ParseBool(raw)
+	if err != nil {
+		return fallback
+	}
+	return value
+}
+
 func durationFromEnv(key string, fallback time.Duration) time.Duration {
 	raw := strings.TrimSpace(os.Getenv(key))
 	if raw == "" {
@@ -105,6 +182,14 @@ func durationFromEnv(key string, fallback time.Duration) time.Duration {
 		return fallback
 	}
 	return value
+}
+
+func hostnameOrUnknown() string {
+	host, err := os.Hostname()
+	if err != nil || strings.TrimSpace(host) == "" {
+		return "unknown"
+	}
+	return host
 }
 
 func firstNonEmpty(values ...string) string {
