@@ -1,0 +1,8 @@
+.git
+.github
+.ref
+bin
+dist
+tmp
+*.log
+README.md
