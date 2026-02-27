@@ -12,6 +12,7 @@ import (
 	"go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetricgrpc"
 	"go.opentelemetry.io/otel/metric"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
+	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 	"go.opentelemetry.io/otel/sdk/resource"
 	semconv "go.opentelemetry.io/otel/semconv/v1.26.0"
 	"nvidia-license-server-exporter/internal/cls"
@@ -84,9 +85,13 @@ func NewMetricsPusher(ctx context.Context, cfg Config, orgName string, snapshotS
 		expOpts = append(expOpts, otlpmetricgrpc.WithInsecure())
 	}
 
-	exporter, err := otlpmetricgrpc.New(ctx, expOpts...)
+	baseExporter, err := otlpmetricgrpc.New(ctx, expOpts...)
 	if err != nil {
 		return nil, fmt.Errorf("create otlp metric exporter: %w", err)
+	}
+	exporter := &loggingExporter{
+		endpoint: cfg.Endpoint,
+		exporter: baseExporter,
 	}
 
 	reader := sdkmetric.NewPeriodicReader(exporter, sdkmetric.WithInterval(cfg.PushInterval))
@@ -239,6 +244,42 @@ func normalizeConfig(cfg Config) Config {
 		cfg.RefreshTimeout = defaultRefreshTimeout
 	}
 	return cfg
+}
+
+type loggingExporter struct {
+	endpoint string
+	exporter sdkmetric.Exporter
+}
+
+func (e *loggingExporter) Temporality(kind sdkmetric.InstrumentKind) metricdata.Temporality {
+	return e.exporter.Temporality(kind)
+}
+
+func (e *loggingExporter) Aggregation(kind sdkmetric.InstrumentKind) sdkmetric.Aggregation {
+	return e.exporter.Aggregation(kind)
+}
+
+func (e *loggingExporter) Export(ctx context.Context, rm *metricdata.ResourceMetrics) error {
+	if err := e.exporter.Export(ctx, rm); err != nil {
+		log.Printf("otel export failed endpoint=%s err=%v", e.endpoint, err)
+		return err
+	}
+
+	metricCount := 0
+	for _, scopeMetrics := range rm.ScopeMetrics {
+		metricCount += len(scopeMetrics.Metrics)
+	}
+
+	log.Printf("otel export succeeded endpoint=%s scopes=%d metrics=%d", e.endpoint, len(rm.ScopeMetrics), metricCount)
+	return nil
+}
+
+func (e *loggingExporter) ForceFlush(ctx context.Context) error {
+	return e.exporter.ForceFlush(ctx)
+}
+
+func (e *loggingExporter) Shutdown(ctx context.Context) error {
+	return e.exporter.Shutdown(ctx)
 }
 
 func buildObservations(orgName string, snap *cls.Snapshot, meta snapshot.Meta) []observation {

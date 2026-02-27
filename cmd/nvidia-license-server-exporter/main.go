@@ -80,6 +80,7 @@ func main() {
 		w.WriteHeader(http.StatusOK)
 		_, _ = fmt.Fprintf(w, "nvidia-license-server-exporter\nscrape metrics at %s\n", *metricsPath)
 	})
+	handler := loggingMiddleware(recoverMiddleware(mux))
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -105,7 +106,8 @@ func main() {
 
 	server := &http.Server{
 		Addr:    *listenAddress,
-		Handler: mux,
+		Handler: handler,
+		ErrorLog: log.New(os.Stderr, "http-server ", log.LstdFlags|log.LUTC),
 	}
 
 	log.Printf("starting nvidia-license-server-exporter on %s", *listenAddress)
@@ -137,6 +139,61 @@ func main() {
 	if err := server.Shutdown(shutdownCtx); err != nil {
 		log.Printf("http shutdown error: %v", err)
 	}
+}
+
+type loggingResponseWriter struct {
+	http.ResponseWriter
+	statusCode int
+	bytes      int
+}
+
+func (w *loggingResponseWriter) WriteHeader(statusCode int) {
+	w.statusCode = statusCode
+	w.ResponseWriter.WriteHeader(statusCode)
+}
+
+func (w *loggingResponseWriter) Write(p []byte) (int, error) {
+	if w.statusCode == 0 {
+		w.statusCode = http.StatusOK
+	}
+	n, err := w.ResponseWriter.Write(p)
+	w.bytes += n
+	return n, err
+}
+
+func recoverMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer func() {
+			if rec := recover(); rec != nil {
+				log.Printf("panic recovered method=%s path=%s err=%v", r.Method, r.URL.Path, rec)
+				http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+			}
+		}()
+		next.ServeHTTP(w, r)
+	})
+}
+
+func loggingMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+		lw := &loggingResponseWriter{
+			ResponseWriter: w,
+			statusCode:     http.StatusOK,
+		}
+
+		next.ServeHTTP(lw, r)
+
+		log.Printf(
+			"http request method=%s path=%s status=%d bytes=%d duration=%s remote=%s user_agent=%q",
+			r.Method,
+			r.URL.Path,
+			lw.statusCode,
+			lw.bytes,
+			time.Since(start).String(),
+			r.RemoteAddr,
+			r.UserAgent(),
+		)
+	})
 }
 
 func getenv(key, fallback string) string {

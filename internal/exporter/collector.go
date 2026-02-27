@@ -2,6 +2,7 @@ package exporter
 
 import (
 	"context"
+	"log"
 	"strconv"
 	"strings"
 	"time"
@@ -101,6 +102,7 @@ func (c *Collector) Collect(ch chan<- prometheus.Metric) {
 
 	snapshot, meta, err := c.snapshotSvc.Get(ctx)
 	if err != nil {
+		log.Printf("cls scrape failed: %v", err)
 		lastMeta := c.snapshotSvc.Meta()
 		ch <- prometheus.MustNewConstMetric(c.upDesc, prometheus.GaugeValue, 0)
 		ch <- prometheus.MustNewConstMetric(c.scrapeDurationDesc, prometheus.GaugeValue, lastMeta.DurationSeconds)
