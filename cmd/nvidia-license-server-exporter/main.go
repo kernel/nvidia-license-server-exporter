@@ -105,8 +105,8 @@ func main() {
 	}
 
 	server := &http.Server{
-		Addr:    *listenAddress,
-		Handler: handler,
+		Addr:     *listenAddress,
+		Handler:  handler,
 		ErrorLog: log.New(os.Stderr, "http-server ", log.LstdFlags|log.LUTC),
 	}
 
