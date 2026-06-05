@@ -1,0 +1,67 @@
+name: Deploy
+
+on:
+  workflow_run:
+    workflows: ["ECR image build / publish"]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Environment to deploy
+        required: true
+        default: staging
+        type: choice
+        options:
+          - staging
+          - production
+      tag:
+        description: ECR image tag to deploy
+        required: true
+        default: main
+
+permissions:
+  contents: read
+
+jobs:
+  trigger:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
+    steps:
+      - name: Resolve dispatch inputs
+        id: resolve
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_ENVIRONMENT: ${{ inputs.environment }}
+          INPUT_TAG: ${{ inputs.tag }}
+          WORKFLOW_RUN_HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            echo "environment=$INPUT_ENVIRONMENT" >> "$GITHUB_OUTPUT"
+            echo "tag=$INPUT_TAG" >> "$GITHUB_OUTPUT"
+          else
+            echo "environment=production" >> "$GITHUB_OUTPUT"
+            echo "tag=sha-${WORKFLOW_RUN_HEAD_SHA}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Generate app token
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.ADMIN_APP_ID }}
+          private-key: ${{ secrets.ADMIN_APP_PRIVATE_KEY }}
+          owner: kernel
+          repositories: kernel
+
+      - name: Dispatch deploy in kernel/kernel
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          DEPLOY_ENVIRONMENT: ${{ steps.resolve.outputs.environment }}
+          DEPLOY_TAG: ${{ steps.resolve.outputs.tag }}
+        run: |
+          gh workflow run nvidia-license-server-exporter.yml \
+            --repo kernel/kernel \
+            --ref main \
+            -f environment="$DEPLOY_ENVIRONMENT" \
+            -f tag="$DEPLOY_TAG"
+          echo "dispatched: environment=$DEPLOY_ENVIRONMENT tag=$DEPLOY_TAG"
