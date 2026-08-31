@@ -1,14 +1,12 @@
 package cls
 
 import (
-	"bytes"
 	"compress/gzip"
 	"context"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net/http"
 	"net/url"
 	"strings"
@@ -664,24 +662,18 @@ func (r *activeLeasesResponse) clients() ([]activeLeaseClient, error) {
 	if r.CompressedClients == "" {
 		return r.Clients, nil
 	}
-	raw, err := base64.StdEncoding.DecodeString(r.CompressedClients)
-	if err != nil {
-		return nil, fmt.Errorf("decode compressedClients base64: %w", err)
-	}
-	gz, err := gzip.NewReader(bytes.NewReader(raw))
+	decoded := base64.NewDecoder(base64.StdEncoding, strings.NewReader(r.CompressedClients))
+	gz, err := gzip.NewReader(decoded)
 	if err != nil {
 		return nil, fmt.Errorf("open compressedClients gzip: %w", err)
 	}
 	defer gz.Close()
-	decompressed, err := io.ReadAll(gz)
-	if err != nil {
-		return nil, fmt.Errorf("decompress compressedClients: %w", err)
-	}
+
 	var payload struct {
 		Clients []activeLeaseClient `json:"clients"`
 	}
-	if err := json.Unmarshal(decompressed, &payload); err != nil {
-		return nil, fmt.Errorf("unmarshal compressedClients: %w", err)
+	if err := json.NewDecoder(gz).Decode(&payload); err != nil {
+		return nil, fmt.Errorf("decode compressedClients: %w", err)
 	}
 	return payload.Clients, nil
 }
