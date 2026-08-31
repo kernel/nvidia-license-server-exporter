@@ -1,10 +1,14 @@
 package cls
 
 import (
+	"bytes"
+	"compress/gzip"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"strings"
@@ -88,6 +92,8 @@ type Snapshot struct {
 type EntitlementFeatureSnapshot struct {
 	VirtualGroupID   int
 	VirtualGroupName string
+	EmsEntitlementID string
+	EmsProductKeyID  string
 	FeatureName      string
 	FeatureVersion   string
 	ProductName      string
@@ -463,6 +469,8 @@ func extractEntitlementFeatureMetrics(virtualGroups []virtualGroup) []Entitlemen
 					metrics = append(metrics, EntitlementFeatureSnapshot{
 						VirtualGroupID:   vg.ID,
 						VirtualGroupName: vg.Name,
+						EmsEntitlementID: entitlement.EmsEntitlementID,
+						EmsProductKeyID:  key.EmsProductKeyID,
 						FeatureName:      feature.FeatureName,
 						FeatureVersion:   feature.FeatureVersion,
 						ProductName:      feature.ProductName,
@@ -516,9 +524,13 @@ func (c *Client) listLicensePools(ctx context.Context, virtualGroupID int, serve
 	return resp.LicensePools, nil
 }
 
+// listActiveLeases uses the /leases/all endpoint rather than /leases: the
+// latter truncates the client list for large orgs, silently capping the
+// reported lease count. /leases/all returns every client, gzip+base64
+// compressed in compressedClients when the payload is large.
 func (c *Client) listActiveLeases(ctx context.Context, virtualGroupID int, serviceInstanceID string) ([]activeLeaseClient, error) {
 	endpoint := fmt.Sprintf(
-		"%s/v1/org/%s/virtual-groups/%d/leases",
+		"%s/v1/org/%s/virtual-groups/%d/leases/all",
 		c.baseURL,
 		url.PathEscape(c.orgName),
 		virtualGroupID,
@@ -527,7 +539,7 @@ func (c *Client) listActiveLeases(ctx context.Context, virtualGroupID int, servi
 	if err := c.doJSON(ctx, http.MethodGet, endpoint, &resp, serviceInstanceID); err != nil {
 		return nil, err
 	}
-	return resp.Clients, nil
+	return resp.clients()
 }
 
 func (c *Client) doJSON(ctx context.Context, method, endpoint string, out any, serviceInstanceID string) error {
@@ -584,10 +596,12 @@ type virtualGroup struct {
 }
 
 type entitlementSummary struct {
+	EmsEntitlementID       string                  `json:"emsEntitlementId"`
 	EntitlementProductKeys []entitlementProductKey `json:"entitlementProductKeys"`
 }
 
 type entitlementProductKey struct {
+	EmsProductKeyID     string               `json:"emsProductKeyId"`
 	EntitlementFeatures []entitlementFeature `json:"entitlementFeatures"`
 }
 
@@ -642,7 +656,34 @@ type licensePoolFeature struct {
 }
 
 type activeLeasesResponse struct {
-	Clients []activeLeaseClient `json:"clients"`
+	Clients           []activeLeaseClient `json:"clients"`
+	CompressedClients string              `json:"compressedClients"`
+}
+
+func (r *activeLeasesResponse) clients() ([]activeLeaseClient, error) {
+	if r.CompressedClients == "" {
+		return r.Clients, nil
+	}
+	raw, err := base64.StdEncoding.DecodeString(r.CompressedClients)
+	if err != nil {
+		return nil, fmt.Errorf("decode compressedClients base64: %w", err)
+	}
+	gz, err := gzip.NewReader(bytes.NewReader(raw))
+	if err != nil {
+		return nil, fmt.Errorf("open compressedClients gzip: %w", err)
+	}
+	defer gz.Close()
+	decompressed, err := io.ReadAll(gz)
+	if err != nil {
+		return nil, fmt.Errorf("decompress compressedClients: %w", err)
+	}
+	var payload struct {
+		Clients []activeLeaseClient `json:"clients"`
+	}
+	if err := json.Unmarshal(decompressed, &payload); err != nil {
+		return nil, fmt.Errorf("unmarshal compressedClients: %w", err)
+	}
+	return payload.Clients, nil
 }
 
 type activeLeaseClient struct {
