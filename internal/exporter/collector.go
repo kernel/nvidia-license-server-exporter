@@ -62,7 +62,7 @@ func NewCollector(snapshotSvc *snapshot.Service, orgName string, scrapeTimeout t
 		),
 		entitlementInUseDesc: prometheus.NewDesc(
 			"nvidia_cls_entitlement_in_use_quantity",
-			"Entitlement quantity currently in use (leased or assigned).",
+			"Entitlement quantity allocated to license servers.",
 			entitlementLabels,
 			constLabel,
 		),
