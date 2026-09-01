@@ -11,22 +11,6 @@ import (
 	"testing"
 )
 
-func TestActiveLeasesResponseClientsPlain(t *testing.T) {
-	resp := activeLeasesResponse{
-		Clients: []activeLeaseClient{
-			{Leases: []activeLease{{LeaseID: "lease-1"}}},
-		},
-	}
-
-	clients, err := resp.clients()
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if len(clients) != 1 || clients[0].Leases[0].LeaseID != "lease-1" {
-		t.Fatalf("unexpected clients: %+v", clients)
-	}
-}
-
 func TestActiveLeasesResponseClientsCompressed(t *testing.T) {
 	resp := activeLeasesResponse{
 		CompressedClients: gzipBase64(t, `{"clients":[{"leases":[{"leaseId":"lease-1"}]},{"leases":[{"leaseId":"lease-2"}]}]}`),
@@ -49,7 +33,6 @@ func TestActiveLeasesResponseClientsBadBase64(t *testing.T) {
 }
 
 func TestListActiveLeasesHTTPContract(t *testing.T) {
-	compressedClients := gzipBase64(t, `{"clients":[{"leases":[{"leaseId":"lease-1"}]}]}`)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			t.Errorf("method: got %s, want GET", r.Method)
@@ -63,7 +46,8 @@ func TestListActiveLeasesHTTPContract(t *testing.T) {
 		if got := r.Header.Get("x-api-key"); got != "test-key" {
 			t.Errorf("x-api-key: got %q, want %q", got, "test-key")
 		}
-		if err := json.NewEncoder(w).Encode(activeLeasesResponse{CompressedClients: compressedClients}); err != nil {
+		resp := activeLeasesResponse{Clients: []activeLeaseClient{{Leases: []activeLease{{LeaseID: "lease-1"}}}}}
+		if err := json.NewEncoder(w).Encode(resp); err != nil {
 			t.Errorf("encode response: %v", err)
 		}
 	}))
@@ -109,16 +93,16 @@ func TestExtractEntitlementFeatureMetricsIDs(t *testing.T) {
 			Name: "DEFAULT_VG",
 			Entitlements: []entitlementSummary{
 				{
-					EmsEntitlementID: "ent-1",
+					EMSEntitlementID: "ent-1",
 					EntitlementProductKeys: []entitlementProductKey{
 						{
-							EmsProductKeyID: "pk-72",
+							EMSProductKeyID: "pk-72",
 							EntitlementFeatures: []entitlementFeature{
 								{FeatureName: "NVIDIA RTX Virtual Workstation", TotalQuantity: 72, InUseQuantity: 53, UnassignedQuantity: 0},
 							},
 						},
 						{
-							EmsProductKeyID: "pk-128",
+							EMSProductKeyID: "pk-128",
 							EntitlementFeatures: []entitlementFeature{
 								{FeatureName: "NVIDIA RTX Virtual Workstation", TotalQuantity: 128, InUseQuantity: 0, UnassignedQuantity: 72},
 							},
@@ -133,10 +117,10 @@ func TestExtractEntitlementFeatureMetricsIDs(t *testing.T) {
 	if len(metrics) != 2 {
 		t.Fatalf("expected 2 entitlement features, got %d", len(metrics))
 	}
-	if metrics[0].EmsProductKeyID == metrics[1].EmsProductKeyID {
-		t.Fatalf("expected distinct product key ids, got %q for both", metrics[0].EmsProductKeyID)
+	if metrics[0].EMSProductKeyID == metrics[1].EMSProductKeyID {
+		t.Fatalf("expected distinct product key ids, got %q for both", metrics[0].EMSProductKeyID)
 	}
-	if metrics[0].EmsEntitlementID != "ent-1" || metrics[1].EmsEntitlementID != "ent-1" {
+	if metrics[0].EMSEntitlementID != "ent-1" || metrics[1].EMSEntitlementID != "ent-1" {
 		t.Fatalf("unexpected entitlement ids: %+v", metrics)
 	}
 }

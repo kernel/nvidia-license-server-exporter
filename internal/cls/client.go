@@ -88,17 +88,17 @@ type Snapshot struct {
 }
 
 type EntitlementFeatureSnapshot struct {
-	VirtualGroupID   int
-	VirtualGroupName string
-	EmsEntitlementID string
-	EmsProductKeyID  string
-	FeatureName      string
-	FeatureVersion   string
-	ProductName      string
-	LicenseType      string
-	TotalQuantity    float64
-	InUseQuantity    float64
-	Unassigned       float64
+	VirtualGroupID     int
+	VirtualGroupName   string
+	EMSEntitlementID   string
+	EMSProductKeyID    string
+	FeatureName        string
+	FeatureVersion     string
+	ProductName        string
+	LicenseType        string
+	TotalQuantity      float64
+	InUseQuantity      float64
+	UnassignedQuantity float64
 }
 
 type ServerFeatureCapacitySnapshot struct {
@@ -465,17 +465,17 @@ func extractEntitlementFeatureMetrics(virtualGroups []virtualGroup) []Entitlemen
 			for _, key := range entitlement.EntitlementProductKeys {
 				for _, feature := range key.EntitlementFeatures {
 					metrics = append(metrics, EntitlementFeatureSnapshot{
-						VirtualGroupID:   vg.ID,
-						VirtualGroupName: vg.Name,
-						EmsEntitlementID: entitlement.EmsEntitlementID,
-						EmsProductKeyID:  key.EmsProductKeyID,
-						FeatureName:      feature.FeatureName,
-						FeatureVersion:   feature.FeatureVersion,
-						ProductName:      feature.ProductName,
-						LicenseType:      feature.LicenseType,
-						TotalQuantity:    feature.TotalQuantity,
-						InUseQuantity:    feature.InUseQuantity,
-						Unassigned:       feature.UnassignedQuantity,
+						VirtualGroupID:     vg.ID,
+						VirtualGroupName:   vg.Name,
+						EMSEntitlementID:   entitlement.EMSEntitlementID,
+						EMSProductKeyID:    key.EMSProductKeyID,
+						FeatureName:        feature.FeatureName,
+						FeatureVersion:     feature.FeatureVersion,
+						ProductName:        feature.ProductName,
+						LicenseType:        feature.LicenseType,
+						TotalQuantity:      feature.TotalQuantity,
+						InUseQuantity:      feature.InUseQuantity,
+						UnassignedQuantity: feature.UnassignedQuantity,
 					})
 				}
 			}
@@ -522,10 +522,6 @@ func (c *Client) listLicensePools(ctx context.Context, virtualGroupID int, serve
 	return resp.LicensePools, nil
 }
 
-// listActiveLeases uses the /leases/all endpoint rather than /leases: the
-// latter truncates the client list for large orgs, silently capping the
-// reported lease count. /leases/all returns every client, gzip+base64
-// compressed in compressedClients when the payload is large.
 func (c *Client) listActiveLeases(ctx context.Context, virtualGroupID int, serviceInstanceID string) ([]activeLeaseClient, error) {
 	endpoint := fmt.Sprintf(
 		"%s/v1/org/%s/virtual-groups/%d/leases/all",
@@ -594,12 +590,12 @@ type virtualGroup struct {
 }
 
 type entitlementSummary struct {
-	EmsEntitlementID       string                  `json:"emsEntitlementId"`
+	EMSEntitlementID       string                  `json:"emsEntitlementId"`
 	EntitlementProductKeys []entitlementProductKey `json:"entitlementProductKeys"`
 }
 
 type entitlementProductKey struct {
-	EmsProductKeyID     string               `json:"emsProductKeyId"`
+	EMSProductKeyID     string               `json:"emsProductKeyId"`
 	EntitlementFeatures []entitlementFeature `json:"entitlementFeatures"`
 }
 

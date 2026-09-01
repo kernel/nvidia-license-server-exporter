@@ -137,8 +137,8 @@ func (c *Collector) Collect(ch chan<- prometheus.Metric) {
 		labels := []string{
 			strconv.Itoa(item.VirtualGroupID),
 			safeLabel(item.VirtualGroupName),
-			safeLabel(item.EmsEntitlementID),
-			safeLabel(item.EmsProductKeyID),
+			safeLabel(item.EMSEntitlementID),
+			safeLabel(item.EMSProductKeyID),
 			safeLabel(item.FeatureName),
 			safeLabel(item.FeatureVersion),
 			safeLabel(item.ProductName),
@@ -146,7 +146,7 @@ func (c *Collector) Collect(ch chan<- prometheus.Metric) {
 		}
 		ch <- prometheus.MustNewConstMetric(c.entitlementTotalDesc, prometheus.GaugeValue, item.TotalQuantity, labels...)
 		ch <- prometheus.MustNewConstMetric(c.entitlementInUseDesc, prometheus.GaugeValue, item.InUseQuantity, labels...)
-		ch <- prometheus.MustNewConstMetric(c.entitlementUnassignedDesc, prometheus.GaugeValue, item.Unassigned, labels...)
+		ch <- prometheus.MustNewConstMetric(c.entitlementUnassignedDesc, prometheus.GaugeValue, item.UnassignedQuantity, labels...)
 	}
 
 	for _, item := range snapshot.ServerFeatureCapacity {
