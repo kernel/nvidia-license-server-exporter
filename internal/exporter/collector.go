@@ -56,7 +56,7 @@ func NewCollector(snapshotSvc *snapshot.Service, orgName string, scrapeTimeout t
 		),
 		entitlementTotalDesc: prometheus.NewDesc(
 			"nvidia_cls_entitlement_total_quantity",
-			"Total entitlement quantity by virtual group and feature (contract capacity).",
+			"Total entitlement quantity by virtual group, entitlement product key, and feature (contract capacity).",
 			entitlementLabels,
 			constLabel,
 		),

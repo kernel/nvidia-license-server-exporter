@@ -533,7 +533,7 @@ func (c *Client) listActiveLeases(ctx context.Context, virtualGroupID int, servi
 	if err := c.doJSON(ctx, http.MethodGet, endpoint, &resp, serviceInstanceID); err != nil {
 		return nil, err
 	}
-	return resp.clients()
+	return resp.decodeClients()
 }
 
 func (c *Client) doJSON(ctx context.Context, method, endpoint string, out any, serviceInstanceID string) error {
@@ -654,7 +654,7 @@ type activeLeasesResponse struct {
 	CompressedClients string              `json:"compressedClients"`
 }
 
-func (r *activeLeasesResponse) clients() ([]activeLeaseClient, error) {
+func (r *activeLeasesResponse) decodeClients() ([]activeLeaseClient, error) {
 	if r.CompressedClients == "" {
 		return r.Clients, nil
 	}

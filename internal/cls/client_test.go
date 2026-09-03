@@ -16,7 +16,7 @@ func TestActiveLeasesResponseClientsCompressed(t *testing.T) {
 		CompressedClients: gzipBase64(t, `{"clients":[{"leases":[{"leaseId":"lease-1"}]},{"leases":[{"leaseId":"lease-2"}]}]}`),
 	}
 
-	clients, err := resp.clients()
+	clients, err := resp.decodeClients()
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -27,7 +27,7 @@ func TestActiveLeasesResponseClientsCompressed(t *testing.T) {
 
 func TestActiveLeasesResponseClientsBadBase64(t *testing.T) {
 	resp := activeLeasesResponse{CompressedClients: "not-base64!!"}
-	if _, err := resp.clients(); err == nil {
+	if _, err := resp.decodeClients(); err == nil {
 		t.Fatal("expected error for invalid base64")
 	}
 }
@@ -72,20 +72,6 @@ func TestListActiveLeasesHTTPContract(t *testing.T) {
 	}
 }
 
-func gzipBase64(t *testing.T, payload string) string {
-	t.Helper()
-
-	var buf bytes.Buffer
-	gz := gzip.NewWriter(&buf)
-	if _, err := gz.Write([]byte(payload)); err != nil {
-		t.Fatalf("gzip write: %v", err)
-	}
-	if err := gz.Close(); err != nil {
-		t.Fatalf("gzip close: %v", err)
-	}
-	return base64.StdEncoding.EncodeToString(buf.Bytes())
-}
-
 func TestExtractEntitlementFeatureMetricsIDs(t *testing.T) {
 	groups := []virtualGroup{
 		{
@@ -123,4 +109,18 @@ func TestExtractEntitlementFeatureMetricsIDs(t *testing.T) {
 	if metrics[0].EMSEntitlementID != "ent-1" || metrics[1].EMSEntitlementID != "ent-1" {
 		t.Fatalf("unexpected entitlement ids: %+v", metrics)
 	}
+}
+
+func gzipBase64(t *testing.T, payload string) string {
+	t.Helper()
+
+	var buf bytes.Buffer
+	gz := gzip.NewWriter(&buf)
+	if _, err := gz.Write([]byte(payload)); err != nil {
+		t.Fatalf("gzip write: %v", err)
+	}
+	if err := gz.Close(); err != nil {
+		t.Fatalf("gzip close: %v", err)
+	}
+	return base64.StdEncoding.EncodeToString(buf.Bytes())
 }
