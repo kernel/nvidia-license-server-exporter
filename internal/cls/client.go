@@ -1,7 +1,9 @@
 package cls
 
 import (
+	"compress/gzip"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -86,15 +88,17 @@ type Snapshot struct {
 }
 
 type EntitlementFeatureSnapshot struct {
-	VirtualGroupID   int
-	VirtualGroupName string
-	FeatureName      string
-	FeatureVersion   string
-	ProductName      string
-	LicenseType      string
-	TotalQuantity    float64
-	InUseQuantity    float64
-	Unassigned       float64
+	VirtualGroupID     int
+	VirtualGroupName   string
+	EMSEntitlementID   string
+	EMSProductKeyID    string
+	FeatureName        string
+	FeatureVersion     string
+	ProductName        string
+	LicenseType        string
+	TotalQuantity      float64
+	InUseQuantity      float64
+	UnassignedQuantity float64
 }
 
 type ServerFeatureCapacitySnapshot struct {
@@ -461,15 +465,17 @@ func extractEntitlementFeatureMetrics(virtualGroups []virtualGroup) []Entitlemen
 			for _, key := range entitlement.EntitlementProductKeys {
 				for _, feature := range key.EntitlementFeatures {
 					metrics = append(metrics, EntitlementFeatureSnapshot{
-						VirtualGroupID:   vg.ID,
-						VirtualGroupName: vg.Name,
-						FeatureName:      feature.FeatureName,
-						FeatureVersion:   feature.FeatureVersion,
-						ProductName:      feature.ProductName,
-						LicenseType:      feature.LicenseType,
-						TotalQuantity:    feature.TotalQuantity,
-						InUseQuantity:    feature.InUseQuantity,
-						Unassigned:       feature.UnassignedQuantity,
+						VirtualGroupID:     vg.ID,
+						VirtualGroupName:   vg.Name,
+						EMSEntitlementID:   entitlement.EMSEntitlementID,
+						EMSProductKeyID:    key.EMSProductKeyID,
+						FeatureName:        feature.FeatureName,
+						FeatureVersion:     feature.FeatureVersion,
+						ProductName:        feature.ProductName,
+						LicenseType:        feature.LicenseType,
+						TotalQuantity:      feature.TotalQuantity,
+						InUseQuantity:      feature.InUseQuantity,
+						UnassignedQuantity: feature.UnassignedQuantity,
 					})
 				}
 			}
@@ -518,7 +524,7 @@ func (c *Client) listLicensePools(ctx context.Context, virtualGroupID int, serve
 
 func (c *Client) listActiveLeases(ctx context.Context, virtualGroupID int, serviceInstanceID string) ([]activeLeaseClient, error) {
 	endpoint := fmt.Sprintf(
-		"%s/v1/org/%s/virtual-groups/%d/leases",
+		"%s/v1/org/%s/virtual-groups/%d/leases/all",
 		c.baseURL,
 		url.PathEscape(c.orgName),
 		virtualGroupID,
@@ -527,7 +533,7 @@ func (c *Client) listActiveLeases(ctx context.Context, virtualGroupID int, servi
 	if err := c.doJSON(ctx, http.MethodGet, endpoint, &resp, serviceInstanceID); err != nil {
 		return nil, err
 	}
-	return resp.Clients, nil
+	return resp.decodeClients()
 }
 
 func (c *Client) doJSON(ctx context.Context, method, endpoint string, out any, serviceInstanceID string) error {
@@ -584,10 +590,12 @@ type virtualGroup struct {
 }
 
 type entitlementSummary struct {
+	EMSEntitlementID       string                  `json:"emsEntitlementId"`
 	EntitlementProductKeys []entitlementProductKey `json:"entitlementProductKeys"`
 }
 
 type entitlementProductKey struct {
+	EMSProductKeyID     string               `json:"emsProductKeyId"`
 	EntitlementFeatures []entitlementFeature `json:"entitlementFeatures"`
 }
 
@@ -642,7 +650,28 @@ type licensePoolFeature struct {
 }
 
 type activeLeasesResponse struct {
-	Clients []activeLeaseClient `json:"clients"`
+	Clients           []activeLeaseClient `json:"clients"`
+	CompressedClients string              `json:"compressedClients"`
+}
+
+func (r *activeLeasesResponse) decodeClients() ([]activeLeaseClient, error) {
+	if r.CompressedClients == "" {
+		return r.Clients, nil
+	}
+	decoded := base64.NewDecoder(base64.StdEncoding, strings.NewReader(r.CompressedClients))
+	gz, err := gzip.NewReader(decoded)
+	if err != nil {
+		return nil, fmt.Errorf("open compressedClients gzip: %w", err)
+	}
+	defer gz.Close()
+
+	var payload struct {
+		Clients []activeLeaseClient `json:"clients"`
+	}
+	if err := json.NewDecoder(gz).Decode(&payload); err != nil {
+		return nil, fmt.Errorf("decode compressedClients: %w", err)
+	}
+	return payload.Clients, nil
 }
 
 type activeLeaseClient struct {

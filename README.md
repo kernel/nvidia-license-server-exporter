@@ -75,9 +75,11 @@ Core health:
 - `nvidia_cls_scrape_duration_seconds`
 - `nvidia_cls_scrape_timestamp_seconds`
 
-Entitlement:
+Entitlement (one series per entitlement product key, labeled by `ems_entitlement_id` and `ems_product_key_id`, so same-product entitlements purchased separately stay distinct; sum across series for the org-wide total):
 
 - `nvidia_cls_entitlement_total_quantity`
+- `nvidia_cls_entitlement_in_use_quantity`
+- `nvidia_cls_entitlement_unassigned_quantity`
 
 Server:
 

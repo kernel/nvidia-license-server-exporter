@@ -23,13 +23,15 @@ const (
 	defaultPushInterval   = 60 * time.Second
 	defaultRefreshTimeout = 20 * time.Second
 
-	metricUp                  = "nvidia_cls_up"
-	metricScrapeDuration      = "nvidia_cls_scrape_duration_seconds"
-	metricScrapeTimestamp     = "nvidia_cls_scrape_timestamp_seconds"
-	metricEntitlementTotal    = "nvidia_cls_entitlement_total_quantity"
-	metricServerInfo          = "nvidia_cls_license_server_info"
-	metricServerFeatureTotal  = "nvidia_cls_license_server_feature_total_quantity"
-	metricServerFeatureActive = "nvidia_cls_license_server_feature_active_leases"
+	metricUp                    = "nvidia_cls_up"
+	metricScrapeDuration        = "nvidia_cls_scrape_duration_seconds"
+	metricScrapeTimestamp       = "nvidia_cls_scrape_timestamp_seconds"
+	metricEntitlementTotal      = "nvidia_cls_entitlement_total_quantity"
+	metricEntitlementInUse      = "nvidia_cls_entitlement_in_use_quantity"
+	metricEntitlementUnassigned = "nvidia_cls_entitlement_unassigned_quantity"
+	metricServerInfo            = "nvidia_cls_license_server_info"
+	metricServerFeatureTotal    = "nvidia_cls_license_server_feature_total_quantity"
+	metricServerFeatureActive   = "nvidia_cls_license_server_feature_active_leases"
 )
 
 type Config struct {
@@ -178,6 +180,14 @@ func (p *MetricsPusher) registerMetrics(meter metric.Meter) error {
 	if err != nil {
 		return fmt.Errorf("create metric nvidia_cls_entitlement_total_quantity: %w", err)
 	}
+	entitlementInUse, err := meter.Float64ObservableGauge(metricEntitlementInUse)
+	if err != nil {
+		return fmt.Errorf("create metric nvidia_cls_entitlement_in_use_quantity: %w", err)
+	}
+	entitlementUnassigned, err := meter.Float64ObservableGauge(metricEntitlementUnassigned)
+	if err != nil {
+		return fmt.Errorf("create metric nvidia_cls_entitlement_unassigned_quantity: %w", err)
+	}
 	serverInfo, err := meter.Float64ObservableGauge(metricServerInfo)
 	if err != nil {
 		return fmt.Errorf("create metric nvidia_cls_license_server_info: %w", err)
@@ -208,6 +218,10 @@ func (p *MetricsPusher) registerMetrics(meter metric.Meter) error {
 					o.ObserveFloat64(scrapeTimestamp, item.value, metric.WithAttributes(item.attrs...))
 				case metricEntitlementTotal:
 					o.ObserveFloat64(entitlementTotal, item.value, metric.WithAttributes(item.attrs...))
+				case metricEntitlementInUse:
+					o.ObserveFloat64(entitlementInUse, item.value, metric.WithAttributes(item.attrs...))
+				case metricEntitlementUnassigned:
+					o.ObserveFloat64(entitlementUnassigned, item.value, metric.WithAttributes(item.attrs...))
 				case metricServerInfo:
 					o.ObserveFloat64(serverInfo, item.value, metric.WithAttributes(item.attrs...))
 				case metricServerFeatureTotal:
@@ -225,6 +239,8 @@ func (p *MetricsPusher) registerMetrics(meter metric.Meter) error {
 		scrapeDuration,
 		scrapeTimestamp,
 		entitlementTotal,
+		entitlementInUse,
+		entitlementUnassigned,
 		serverInfo,
 		serverFeatureTotal,
 		serverFeatureActive,
@@ -283,7 +299,7 @@ func (e *loggingExporter) Shutdown(ctx context.Context) error {
 }
 
 func buildObservations(orgName string, snap *cls.Snapshot, meta snapshot.Meta) []observation {
-	observations := make([]observation, 0, 3+len(snap.EntitlementFeatures)+len(snap.ServerFeatureCapacity)+len(snap.ServerFeatureActiveLeases)+len(snap.ServerUsage))
+	observations := make([]observation, 0, 3+3*len(snap.EntitlementFeatures)+len(snap.ServerFeatureCapacity)+len(snap.ServerFeatureActiveLeases)+len(snap.ServerUsage))
 	orgAttr := attribute.String("org_name", orgName)
 
 	observations = append(observations,
@@ -293,19 +309,22 @@ func buildObservations(orgName string, snap *cls.Snapshot, meta snapshot.Meta) [
 	)
 
 	for _, item := range snap.EntitlementFeatures {
-		observations = append(observations, observation{
-			name:  metricEntitlementTotal,
-			value: item.TotalQuantity,
-			attrs: []attribute.KeyValue{
-				orgAttr,
-				attribute.String("virtual_group_id", strconv.Itoa(item.VirtualGroupID)),
-				attribute.String("virtual_group_name", safeLabel(item.VirtualGroupName)),
-				attribute.String("feature_name", safeLabel(item.FeatureName)),
-				attribute.String("feature_version", safeLabel(item.FeatureVersion)),
-				attribute.String("product_name", safeLabel(item.ProductName)),
-				attribute.String("license_type", safeLabel(item.LicenseType)),
-			},
-		})
+		attrs := []attribute.KeyValue{
+			orgAttr,
+			attribute.String("virtual_group_id", strconv.Itoa(item.VirtualGroupID)),
+			attribute.String("virtual_group_name", safeLabel(item.VirtualGroupName)),
+			attribute.String("ems_entitlement_id", safeLabel(item.EMSEntitlementID)),
+			attribute.String("ems_product_key_id", safeLabel(item.EMSProductKeyID)),
+			attribute.String("feature_name", safeLabel(item.FeatureName)),
+			attribute.String("feature_version", safeLabel(item.FeatureVersion)),
+			attribute.String("product_name", safeLabel(item.ProductName)),
+			attribute.String("license_type", safeLabel(item.LicenseType)),
+		}
+		observations = append(observations,
+			observation{name: metricEntitlementTotal, value: item.TotalQuantity, attrs: attrs},
+			observation{name: metricEntitlementInUse, value: item.InUseQuantity, attrs: attrs},
+			observation{name: metricEntitlementUnassigned, value: item.UnassignedQuantity, attrs: attrs},
+		)
 	}
 
 	for _, item := range snap.ServerFeatureCapacity {

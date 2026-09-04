@@ -15,19 +15,22 @@ type Collector struct {
 	snapshotSvc   *snapshot.Service
 	scrapeTimeout time.Duration
 
-	upDesc                  *prometheus.Desc
-	scrapeDurationDesc      *prometheus.Desc
-	scrapeTimestampDesc     *prometheus.Desc
-	entitlementTotalDesc    *prometheus.Desc
-	serverInfoDesc          *prometheus.Desc
-	serverFeatureCapacity   *prometheus.Desc
-	serverFeatureActiveDesc *prometheus.Desc
+	upDesc                    *prometheus.Desc
+	scrapeDurationDesc        *prometheus.Desc
+	scrapeTimestampDesc       *prometheus.Desc
+	entitlementTotalDesc      *prometheus.Desc
+	entitlementInUseDesc      *prometheus.Desc
+	entitlementUnassignedDesc *prometheus.Desc
+	serverInfoDesc            *prometheus.Desc
+	serverFeatureCapacity     *prometheus.Desc
+	serverFeatureActiveDesc   *prometheus.Desc
 
 	descs []*prometheus.Desc
 }
 
 func NewCollector(snapshotSvc *snapshot.Service, orgName string, scrapeTimeout time.Duration) *Collector {
 	constLabel := prometheus.Labels{"org_name": orgName}
+	entitlementLabels := []string{"virtual_group_id", "virtual_group_name", "ems_entitlement_id", "ems_product_key_id", "feature_name", "feature_version", "product_name", "license_type"}
 
 	c := &Collector{
 		snapshotSvc:   snapshotSvc,
@@ -53,8 +56,20 @@ func NewCollector(snapshotSvc *snapshot.Service, orgName string, scrapeTimeout t
 		),
 		entitlementTotalDesc: prometheus.NewDesc(
 			"nvidia_cls_entitlement_total_quantity",
-			"Total entitlement quantity by virtual group and feature (contract capacity).",
-			[]string{"virtual_group_id", "virtual_group_name", "feature_name", "feature_version", "product_name", "license_type"},
+			"Total entitlement quantity by virtual group, entitlement product key, and feature (contract capacity).",
+			entitlementLabels,
+			constLabel,
+		),
+		entitlementInUseDesc: prometheus.NewDesc(
+			"nvidia_cls_entitlement_in_use_quantity",
+			"Entitlement quantity allocated to license servers.",
+			entitlementLabels,
+			constLabel,
+		),
+		entitlementUnassignedDesc: prometheus.NewDesc(
+			"nvidia_cls_entitlement_unassigned_quantity",
+			"Entitlement quantity not yet assigned to any license server.",
+			entitlementLabels,
 			constLabel,
 		),
 		serverInfoDesc: prometheus.NewDesc(
@@ -82,6 +97,8 @@ func NewCollector(snapshotSvc *snapshot.Service, orgName string, scrapeTimeout t
 		c.scrapeDurationDesc,
 		c.scrapeTimestampDesc,
 		c.entitlementTotalDesc,
+		c.entitlementInUseDesc,
+		c.entitlementUnassignedDesc,
 		c.serverInfoDesc,
 		c.serverFeatureCapacity,
 		c.serverFeatureActiveDesc,
@@ -120,12 +137,16 @@ func (c *Collector) Collect(ch chan<- prometheus.Metric) {
 		labels := []string{
 			strconv.Itoa(item.VirtualGroupID),
 			safeLabel(item.VirtualGroupName),
+			safeLabel(item.EMSEntitlementID),
+			safeLabel(item.EMSProductKeyID),
 			safeLabel(item.FeatureName),
 			safeLabel(item.FeatureVersion),
 			safeLabel(item.ProductName),
 			safeLabel(item.LicenseType),
 		}
 		ch <- prometheus.MustNewConstMetric(c.entitlementTotalDesc, prometheus.GaugeValue, item.TotalQuantity, labels...)
+		ch <- prometheus.MustNewConstMetric(c.entitlementInUseDesc, prometheus.GaugeValue, item.InUseQuantity, labels...)
+		ch <- prometheus.MustNewConstMetric(c.entitlementUnassignedDesc, prometheus.GaugeValue, item.UnassignedQuantity, labels...)
 	}
 
 	for _, item := range snapshot.ServerFeatureCapacity {

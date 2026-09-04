@@ -30,13 +30,17 @@ func TestBuildObservationsMapping(t *testing.T) {
 	snap := &cls.Snapshot{
 		EntitlementFeatures: []cls.EntitlementFeatureSnapshot{
 			{
-				VirtualGroupID:   101,
-				VirtualGroupName: "VG",
-				FeatureName:      "Feature A",
-				FeatureVersion:   "1.0",
-				ProductName:      "Product",
-				LicenseType:      "TYPE",
-				TotalQuantity:    128,
+				VirtualGroupID:     101,
+				VirtualGroupName:   "VG",
+				EMSEntitlementID:   "ent-1",
+				EMSProductKeyID:    "pk-1",
+				FeatureName:        "Feature A",
+				FeatureVersion:     "1.0",
+				ProductName:        "Product",
+				LicenseType:        "TYPE",
+				TotalQuantity:      128,
+				InUseQuantity:      53,
+				UnassignedQuantity: 75,
 			},
 		},
 		ServerFeatureCapacity: []cls.ServerFeatureCapacitySnapshot{
@@ -77,8 +81,8 @@ func TestBuildObservationsMapping(t *testing.T) {
 	}
 
 	obs := buildObservations("org-1", snap, meta)
-	if len(obs) != 7 {
-		t.Fatalf("expected 7 observations, got %d", len(obs))
+	if len(obs) != 9 {
+		t.Fatalf("expected 9 observations, got %d", len(obs))
 	}
 
 	counts := make(map[string]int)
@@ -88,12 +92,20 @@ func TestBuildObservationsMapping(t *testing.T) {
 		if attrs["org_name"] != "org-1" {
 			t.Fatalf("observation %s missing org_name attribute", o.name)
 		}
+		switch o.name {
+		case metricEntitlementTotal, metricEntitlementInUse, metricEntitlementUnassigned:
+			if attrs["ems_entitlement_id"] != "ent-1" || attrs["ems_product_key_id"] != "pk-1" {
+				t.Fatalf("observation %s missing entitlement id attributes: %v", o.name, attrs)
+			}
+		}
 	}
 
 	if counts[metricUp] != 1 ||
 		counts[metricScrapeDuration] != 1 ||
 		counts[metricScrapeTimestamp] != 1 ||
 		counts[metricEntitlementTotal] != 1 ||
+		counts[metricEntitlementInUse] != 1 ||
+		counts[metricEntitlementUnassigned] != 1 ||
 		counts[metricServerFeatureTotal] != 1 ||
 		counts[metricServerFeatureActive] != 1 ||
 		counts[metricServerInfo] != 1 {
