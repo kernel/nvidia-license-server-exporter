@@ -1,6 +1,6 @@
 module nvidia-license-server-exporter
 
-go 1.25.0
+go 1.27.2
 
 require (
 	github.com/prometheus/client_golang v1.23.2
