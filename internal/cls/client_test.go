@@ -15,8 +15,8 @@ import (
 const (
 	virtualGroupsBody = `{"virtualGroups":[{"id":42,"name":"DEFAULT_VG","entitlements":[{"emsEntitlementId":"ent-1","entitlementProductKeys":[{"emsProductKeyId":"pk-1","entitlementFeatures":[{"featureName":"NVIDIA RTX Virtual Workstation","featureVersion":"1.0","productName":"NVIDIA RTX Virtual Workstation","licenseType":"CONCURRENT_COUNTED_SINGLE","totalQuantity":200,"inUseQuantity":200,"unassignedQuantity":0}]}]}]}]}`
 
-	allocationsPage0 = `{"allocations":[{"id":"alloc-1","name":"vgpu-license-server-0","status":"ENABLED","deployedOn":"CLOUD","leasingMode":"STANDARD","serviceInstanceId":"si-1","allocationFeatures":[{"id":"af-1","featureName":"NVIDIA RTX Virtual Workstation","productName":"NVIDIA RTX Virtual Workstation","licenseType":"CONCURRENT_COUNTED_SINGLE","totalQuantity":200}]}],"paginationInfo":{"index":0,"size":1,"totalResults":2,"totalPages":2}}`
-	allocationsPage1 = `{"allocations":[{"id":"alloc-2","name":"not-deployed","status":"DISABLED","virtualGroupId":42,"virtualGroupName":"DEFAULT_VG","deployedOn":"NOT_DEPLOYED","allocationFeatures":[]}],"paginationInfo":{"index":1,"size":1,"totalResults":2,"totalPages":2}}`
+	allocationsPage0 = `{"allocations":[{"id":"alloc-1","type":"NVIDIA","name":"vgpu-license-server-0","status":"ENABLED","deployedOn":"CLOUD","leasingMode":"STANDARD","serviceInstanceId":"si-1","allocationFeatures":[{"id":"af-1","featureName":"NVIDIA RTX Virtual Workstation","productName":"NVIDIA RTX Virtual Workstation","licenseType":"CONCURRENT_COUNTED_SINGLE","totalQuantity":200}]}],"paginationInfo":{"index":0,"size":1,"totalResults":2,"totalPages":2}}`
+	allocationsPage1 = `{"allocations":[{"id":"alloc-2","type":"NVIDIA","name":"not-deployed","status":"DISABLED","virtualGroupId":42,"virtualGroupName":"DEFAULT_VG","deployedOn":"NOT_DEPLOYED","allocationFeatures":[]}],"paginationInfo":{"index":1,"size":1,"totalResults":2,"totalPages":2}}`
 
 	leasesPage0 = `{"clients":[{"hostname":"browser-a","leases":[{"leaseId":"lease-1","featureName":"NVIDIA RTX Virtual Workstation","licenseAllotmentFeatureId":"af-1"},{"leaseId":"lease-2","featureName":"NVIDIA RTX Virtual Workstation","licenseAllotmentFeatureId":"af-1"}]}],"paginationInfo":{"index":0,"size":2,"totalResults":4,"totalPages":2}}`
 	leasesPage1 = `{"clients":[{"hostname":"browser-b","leases":[{"leaseId":"lease-2","featureName":"NVIDIA RTX Virtual Workstation","licenseAllotmentFeatureId":"af-1"},{"leaseId":"lease-3","featureName":"Unmapped Feature","licenseAllotmentFeatureId":"af-missing"}]}],"paginationInfo":{"index":1,"size":2,"totalResults":4,"totalPages":2}}`
@@ -103,7 +103,7 @@ func newTestClient(t *testing.T, fake *fakeCLS, cfg Config) *Client {
 
 func TestFetchSnapshotUsesSupportedEndpoints(t *testing.T) {
 	fake := &fakeCLS{leases: map[string][]string{"alloc-1": {leasesPage0, leasesPage1}}}
-	client := newTestClient(t, fake, Config{})
+	client := newTestClient(t, fake, Config{ServiceInstanceID: "si-default"})
 
 	snap, err := client.FetchSnapshot(context.Background())
 	if err != nil {
@@ -181,8 +181,8 @@ func TestFetchSnapshotUsesSupportedEndpoints(t *testing.T) {
 
 func TestFetchSnapshotUsesConfiguredServiceInstanceFallback(t *testing.T) {
 	fake := &fakeCLS{
-		allocationPages: []string{allocationsPage1},
-		leases:          map[string][]string{"alloc-2": {`{"clients":[],"paginationInfo":{"index":0,"size":0,"totalResults":0,"totalPages":0}}`}},
+		allocationPages: []string{`{"allocations":[{"id":"alloc-1","type":"NVIDIA","deployedOn":"CLOUD","allocationFeatures":[]}],"paginationInfo":{"index":0,"totalPages":1}}`},
+		leases:          map[string][]string{"alloc-1": {`{"clients":[],"paginationInfo":{"index":0,"size":0,"totalResults":0,"totalPages":0}}`}},
 	}
 	client := newTestClient(t, fake, Config{ServiceInstanceID: "si-default"})
 
@@ -201,6 +201,40 @@ func TestFetchSnapshotUsesConfiguredServiceInstanceFallback(t *testing.T) {
 	}
 	if leaseRequests != 1 {
 		t.Fatalf("lease requests = %d, want 1", leaseRequests)
+	}
+}
+
+func TestFetchSnapshotSkipsNonCLSLeases(t *testing.T) {
+	for _, tc := range []struct {
+		name              string
+		allocationType    string
+		deployedOn        string
+		serviceInstanceID string
+	}{
+		{name: "undeployed", allocationType: "NVIDIA", deployedOn: "NOT_DEPLOYED"},
+		{name: "not applicable", allocationType: "NVIDIA", deployedOn: "NOT_APPLICABLE"},
+		{name: "on premises", allocationType: "NVIDIA", deployedOn: "ON_PREM", serviceInstanceID: "si-dls"},
+		{name: "mellanox", allocationType: "MELLANOX"},
+		{name: "bright", allocationType: "BRIGHT"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fake := &fakeCLS{allocationPages: []string{fmt.Sprintf(`{"allocations":[{"id":"alloc-2","type":%q,"deployedOn":%q,"serviceInstanceId":%q,"allocationFeatures":[{"id":"af-1","featureName":"Feature","productName":"Product","licenseType":"CONCURRENT_COUNTED_SINGLE","totalQuantity":10}]}],"paginationInfo":{"totalPages":1}}`, tc.allocationType, tc.deployedOn, tc.serviceInstanceID)}}
+			client := newTestClient(t, fake, Config{ServiceInstanceID: "si-default"})
+
+			snap, err := client.FetchSnapshot(context.Background())
+			if err != nil {
+				t.Fatalf("fetch snapshot: %v", err)
+			}
+			if len(snap.ServerInfo) != 1 || len(snap.ServerFeatureCapacity) != 1 || snap.ServerFeatureCapacity[0].TotalQuantity != 10 {
+				t.Fatalf("expected allocation metadata and capacity to be preserved, got %+v", snap)
+			}
+			if len(snap.ServerFeatureActiveLeases) != 0 {
+				t.Fatalf("unexpected active leases: %+v", snap.ServerFeatureActiveLeases)
+			}
+			if paths := fake.paths(); len(paths) != 2 {
+				t.Fatalf("expected only virtual-group and allocation requests, got %v", paths)
+			}
+		})
 	}
 }
 

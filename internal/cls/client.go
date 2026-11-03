@@ -255,11 +255,16 @@ func (c *Client) listAllocations(ctx context.Context, vg virtualGroup) ([]alloca
 	return allocations, nil
 }
 
-// listAllocationLeases walks the paginated active leases of one allocation.
-// The leases endpoint is scoped by the service instance header, and the
-// license_server_ids filter attributes the leases to this allocation. An
-// allocation without a service instance has no clients and no leases.
+// listAllocationLeases walks the paginated active leases of one CLS allocation.
+// A configured service instance fills in missing binding metadata; it does not
+// override an allocation's type or deployment.
 func (c *Client) listAllocationLeases(ctx context.Context, a allocation) ([]lease, error) {
+	if a.Type == "MELLANOX" || a.Type == "BRIGHT" {
+		return nil, nil
+	}
+	if a.DeployedOn != "" && a.DeployedOn != "CLOUD" {
+		return nil, nil
+	}
 	serviceInstanceID := firstNonEmptyNonBlank(a.ServiceInstanceID, c.serviceInstanceID)
 	if serviceInstanceID == "" {
 		return nil, nil
@@ -395,6 +400,7 @@ func (r allocationsResponse) pagination() paginationInfo {
 
 type allocation struct {
 	ID                 string              `json:"id"`
+	Type               string              `json:"type"`
 	Name               string              `json:"name"`
 	Status             string              `json:"status"`
 	VirtualGroupID     int                 `json:"virtualGroupId"`

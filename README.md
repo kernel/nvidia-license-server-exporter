@@ -22,6 +22,8 @@ The exporter reads the supported listing endpoints of the NVIDIA Licensing Porta
 - `GET /v1/org/{org}/virtual-groups/{vg}/allocations` (paginated) for license servers and their features
 - `GET /v1/org/{org}/virtual-groups/{vg}/leases` (paginated, filtered by `license_server_ids`, scoped by `X-NV-SERVICE-INSTANCE-ID`) for active leases
 
+Lease lookups skip network-license allocations and explicitly non-cloud deployments, even when `NVIDIA_SERVICE_INSTANCE_ID` is configured. Their metadata and capacity are still exported.
+
 NVIDIA retired `.../license-servers/{id}/license-pools` (it now answers HTTP 400 "This API is no longer supported") and deprecated `.../license-servers` in favor of allocations; neither is used.
 
 ## Configuration
