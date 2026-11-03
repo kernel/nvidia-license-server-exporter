@@ -329,6 +329,10 @@ func (c *Client) doJSON(ctx context.Context, method, endpoint string, out any, s
 	}
 	defer resp.Body.Close()
 
+	// NVIDIA echoes the submitted API key in unauthorized response bodies.
+	if resp.StatusCode == http.StatusUnauthorized {
+		return fmt.Errorf("request %s failed with status %d", endpoint, resp.StatusCode)
+	}
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
 		return fmt.Errorf("request %s failed with status %d: %s", endpoint, resp.StatusCode, errorBody(resp.Body))
 	}

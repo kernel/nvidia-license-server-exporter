@@ -38,7 +38,7 @@ func (f *fakeCLS) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	f.mu.Unlock()
 
 	if r.Header.Get("x-api-key") != "test-key" {
-		http.Error(w, `{"message":"Unauthorized"}`, http.StatusUnauthorized)
+		http.Error(w, fmt.Sprintf(`{"message":"Invalid api-key %s"}`, r.Header.Get("x-api-key")), http.StatusUnauthorized)
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
@@ -250,6 +250,22 @@ func TestFetchSnapshotErrorIncludesResponseBody(t *testing.T) {
 		if !strings.Contains(err.Error(), want) {
 			t.Fatalf("error %q does not mention %q", err, want)
 		}
+	}
+}
+
+func TestFetchSnapshotUnauthorizedErrorDoesNotExposeAPIKey(t *testing.T) {
+	const apiKey = "invalid-test-key"
+	client := newTestClient(t, &fakeCLS{}, Config{APIKey: apiKey})
+
+	snap, err := client.FetchSnapshot(context.Background())
+	if snap != nil || err == nil {
+		t.Fatalf("expected failed snapshot, got snapshot=%v err=%v", snap, err)
+	}
+	if !strings.Contains(err.Error(), "failed with status 401") {
+		t.Fatalf("expected unauthorized error, got %v", err)
+	}
+	if strings.Contains(err.Error(), apiKey) {
+		t.Fatal("unauthorized error exposes the API key")
 	}
 }
 
