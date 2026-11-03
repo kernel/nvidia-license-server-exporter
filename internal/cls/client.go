@@ -1,14 +1,14 @@
 package cls
 
 import (
-	"compress/gzip"
 	"context"
-	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -22,6 +22,8 @@ const (
 	defaultParallelFetches   = 8
 	defaultUserAgent         = "nvidia-license-server-exporter/0.1"
 	defaultContentTypeHeader = "application/json"
+	maxPages                 = 500
+	maxErrorBodyBytes        = 512
 )
 
 type Config struct {
@@ -76,15 +78,15 @@ func NewClient(cfg Config) (*Client, error) {
 	}, nil
 }
 
+// Snapshot is one collection from the CLS API. NVIDIA now calls a license
+// server an allocation; the Server* names are kept so the exported metric
+// names and labels stay stable.
 type Snapshot struct {
 	CollectedAt               time.Time
 	EntitlementFeatures       []EntitlementFeatureSnapshot
 	ServerFeatureCapacity     []ServerFeatureCapacitySnapshot
-	ServerUsage               []ServerUsageSnapshot
-	ServerActiveLeases        []ServerActiveLeaseSnapshot
+	ServerInfo                []ServerInfoSnapshot
 	ServerFeatureActiveLeases []ServerFeatureActiveLeaseSnapshot
-	ActiveLeaseTotal          float64
-	PoolUsage                 []PoolUsageSnapshot
 }
 
 type EntitlementFeatureSnapshot struct {
@@ -106,16 +108,13 @@ type ServerFeatureCapacitySnapshot struct {
 	VirtualGroupName string
 	ServerID         string
 	ServerName       string
-	ServerStatus     string
-	DeployedOn       string
-	LeasingMode      string
 	FeatureName      string
 	ProductName      string
 	LicenseType      string
 	TotalQuantity    float64
 }
 
-type ServerUsageSnapshot struct {
+type ServerInfoSnapshot struct {
 	VirtualGroupID   int
 	VirtualGroupName string
 	ServerID         string
@@ -123,17 +122,6 @@ type ServerUsageSnapshot struct {
 	ServerStatus     string
 	DeployedOn       string
 	LeasingMode      string
-	Allocated        float64
-	InUse            float64
-	Available        float64
-}
-
-type ServerActiveLeaseSnapshot struct {
-	VirtualGroupID   int
-	VirtualGroupName string
-	ServerID         string
-	ServerName       string
-	ActiveLeases     float64
 }
 
 type ServerFeatureActiveLeaseSnapshot struct {
@@ -147,21 +135,6 @@ type ServerFeatureActiveLeaseSnapshot struct {
 	ActiveLeases     float64
 }
 
-type PoolUsageSnapshot struct {
-	VirtualGroupID   int
-	VirtualGroupName string
-	ServerID         string
-	ServerName       string
-	PoolID           string
-	PoolName         string
-	FeatureName      string
-	ProductName      string
-	LicenseType      string
-	Allocated        float64
-	InUse            float64
-	Available        float64
-}
-
 func (c *Client) FetchSnapshot(ctx context.Context) (*Snapshot, error) {
 	virtualGroups, err := c.listVirtualGroups(ctx)
 	if err != nil {
@@ -173,289 +146,48 @@ func (c *Client) FetchSnapshot(ctx context.Context) (*Snapshot, error) {
 		EntitlementFeatures: extractEntitlementFeatureMetrics(virtualGroups),
 	}
 
-	serversByVG := make(map[int][]licenseServer, len(virtualGroups))
-	serverGroup, groupCtx := errgroup.WithContext(ctx)
-	serverGroup.SetLimit(c.parallelFetches)
-
-	var serverMu sync.Mutex
+	var allocations []allocation
+	var allocationsMu sync.Mutex
+	allocationGroup, allocationCtx := errgroup.WithContext(ctx)
+	allocationGroup.SetLimit(c.parallelFetches)
 	for _, vg := range virtualGroups {
-		vg := vg
-		serverGroup.Go(func() error {
-			servers, listErr := c.listLicenseServers(groupCtx, vg.ID)
-			if listErr != nil {
-				return fmt.Errorf("list license servers for virtual-group %d: %w", vg.ID, listErr)
+		allocationGroup.Go(func() error {
+			listed, err := c.listAllocations(allocationCtx, vg)
+			if err != nil {
+				return fmt.Errorf("list allocations for virtual-group %d: %w", vg.ID, err)
 			}
-			for i := range servers {
-				if servers[i].VirtualGroupID == 0 {
-					servers[i].VirtualGroupID = vg.ID
-				}
-				if servers[i].VirtualGroupName == "" {
-					servers[i].VirtualGroupName = vg.Name
-				}
-			}
-			serverMu.Lock()
-			serversByVG[vg.ID] = servers
-			serverMu.Unlock()
+			allocationsMu.Lock()
+			allocations = append(allocations, listed...)
+			allocationsMu.Unlock()
 			return nil
 		})
 	}
-	if err := serverGroup.Wait(); err != nil {
+	if err := allocationGroup.Wait(); err != nil {
 		return nil, err
 	}
-
-	activeByServer, serverActiveLeases, serverFeatureActiveLeases, activeLeaseTotal, err := c.fetchActiveLeaseUsage(ctx, serversByVG)
-	if err != nil {
-		return nil, err
-	}
-	snapshot.ActiveLeaseTotal = activeLeaseTotal
-	snapshot.ServerActiveLeases = serverActiveLeases
-	snapshot.ServerFeatureActiveLeases = serverFeatureActiveLeases
-
-	poolGroup, poolCtx := errgroup.WithContext(ctx)
-	poolGroup.SetLimit(c.parallelFetches)
 
 	var snapshotMu sync.Mutex
-	for _, vg := range virtualGroups {
-		vg := vg
-		servers := serversByVG[vg.ID]
-		for _, server := range servers {
-			server := server
-			poolGroup.Go(func() error {
-				pools, listErr := c.listLicensePools(poolCtx, vg.ID, server.ID)
-				if listErr != nil {
-					return fmt.Errorf("list license pools for server %s in virtual-group %d: %w", server.ID, vg.ID, listErr)
-				}
-
-				featureByID := make(map[string]licenseServerFeature, len(server.LicenseServerFeatures))
-				serverFeatureCapacity := make([]ServerFeatureCapacitySnapshot, 0, len(server.LicenseServerFeatures))
-				for _, feature := range server.LicenseServerFeatures {
-					featureByID[feature.ID] = feature
-					serverFeatureCapacity = append(serverFeatureCapacity, ServerFeatureCapacitySnapshot{
-						VirtualGroupID:   server.VirtualGroupID,
-						VirtualGroupName: server.VirtualGroupName,
-						ServerID:         server.ID,
-						ServerName:       server.Name,
-						ServerStatus:     server.Status,
-						DeployedOn:       server.DeployedOn,
-						LeasingMode:      server.LeasingMode,
-						FeatureName:      feature.FeatureName,
-						ProductName:      feature.ProductName,
-						LicenseType:      feature.LicenseType,
-						TotalQuantity:    feature.TotalQuantity,
-					})
-				}
-
-				poolUsage := make([]PoolUsageSnapshot, 0)
-				var serverAllocated float64
-				var serverInUse float64
-
-				for _, pool := range pools {
-					for _, feature := range pool.LicensePoolFeatures {
-						serverFeature := featureByID[feature.LicenseServerFeatureID]
-						allocated := feature.TotalAllotment
-						inUse := feature.InUse
-						available := allocated - inUse
-						if available < 0 {
-							available = 0
-						}
-
-						serverAllocated += allocated
-						serverInUse += inUse
-						poolUsage = append(poolUsage, PoolUsageSnapshot{
-							VirtualGroupID:   server.VirtualGroupID,
-							VirtualGroupName: server.VirtualGroupName,
-							ServerID:         server.ID,
-							ServerName:       server.Name,
-							PoolID:           pool.ID,
-							PoolName:         pool.Name,
-							FeatureName:      serverFeature.FeatureName,
-							ProductName:      serverFeature.ProductName,
-							LicenseType:      serverFeature.LicenseType,
-							Allocated:        allocated,
-							InUse:            inUse,
-							Available:        available,
-						})
-					}
-				}
-
-				serverUsage := ServerUsageSnapshot{
-					VirtualGroupID:   server.VirtualGroupID,
-					VirtualGroupName: server.VirtualGroupName,
-					ServerID:         server.ID,
-					ServerName:       server.Name,
-					ServerStatus:     server.Status,
-					DeployedOn:       server.DeployedOn,
-					LeasingMode:      server.LeasingMode,
-					Allocated:        serverAllocated,
-					InUse:            serverInUse,
-					Available:        maxFloat64(0, serverAllocated-serverInUse),
-				}
-				if activeLeaseCount, ok := activeByServer[server.ID]; ok {
-					serverUsage.InUse = activeLeaseCount
-					serverUsage.Available = maxFloat64(0, serverAllocated-activeLeaseCount)
-				}
-
-				snapshotMu.Lock()
-				snapshot.PoolUsage = append(snapshot.PoolUsage, poolUsage...)
-				snapshot.ServerUsage = append(snapshot.ServerUsage, serverUsage)
-				snapshot.ServerFeatureCapacity = append(snapshot.ServerFeatureCapacity, serverFeatureCapacity...)
-				snapshotMu.Unlock()
-				return nil
-			})
-		}
+	leaseGroup, leaseCtx := errgroup.WithContext(ctx)
+	leaseGroup.SetLimit(c.parallelFetches)
+	for _, a := range allocations {
+		leaseGroup.Go(func() error {
+			leases, err := c.listAllocationLeases(leaseCtx, a)
+			if err != nil {
+				return fmt.Errorf("list active leases for allocation %s in virtual-group %d: %w", a.ID, a.VirtualGroupID, err)
+			}
+			snapshotMu.Lock()
+			snapshot.ServerInfo = append(snapshot.ServerInfo, a.info())
+			snapshot.ServerFeatureCapacity = append(snapshot.ServerFeatureCapacity, a.featureCapacity()...)
+			snapshot.ServerFeatureActiveLeases = append(snapshot.ServerFeatureActiveLeases, a.featureActiveLeases(leases)...)
+			snapshotMu.Unlock()
+			return nil
+		})
 	}
-	if err := poolGroup.Wait(); err != nil {
+	if err := leaseGroup.Wait(); err != nil {
 		return nil, err
 	}
 
 	return snapshot, nil
-}
-
-type activeFeatureKey struct {
-	virtualGroupID   int
-	virtualGroupName string
-	serverID         string
-	serverName       string
-	featureName      string
-	productName      string
-	licenseType      string
-}
-
-func (c *Client) fetchActiveLeaseUsage(ctx context.Context, serversByVG map[int][]licenseServer) (map[string]float64, []ServerActiveLeaseSnapshot, []ServerFeatureActiveLeaseSnapshot, float64, error) {
-	serverTotals := make(map[string]float64)
-	featureTotals := make(map[activeFeatureKey]float64)
-	seenLeaseIDs := make(map[string]struct{})
-
-	activeGroup, activeCtx := errgroup.WithContext(ctx)
-	activeGroup.SetLimit(c.parallelFetches)
-
-	var total float64
-	var mu sync.Mutex
-
-	for virtualGroupID, servers := range serversByVG {
-		if len(servers) == 0 {
-			continue
-		}
-
-		virtualGroupID := virtualGroupID
-		virtualGroupName := servers[0].VirtualGroupName
-		serverByID := make(map[string]licenseServer, len(servers))
-		featureByAllotmentID := make(map[string]licenseServerFeature)
-		serviceInstanceIDs := make(map[string]struct{})
-
-		for _, server := range servers {
-			serverByID[server.ID] = server
-			for _, feature := range server.LicenseServerFeatures {
-				featureByAllotmentID[feature.ID] = feature
-			}
-			if strings.TrimSpace(server.ServiceInstanceID) != "" {
-				serviceInstanceIDs[server.ServiceInstanceID] = struct{}{}
-			}
-		}
-
-		for serviceInstanceID := range serviceInstanceIDs {
-			serviceInstanceID := serviceInstanceID
-			activeGroup.Go(func() error {
-				clients, err := c.listActiveLeases(activeCtx, virtualGroupID, serviceInstanceID)
-				if err != nil {
-					return fmt.Errorf("list active leases for virtual-group %d service-instance %s: %w", virtualGroupID, serviceInstanceID, err)
-				}
-
-				for _, client := range clients {
-					serverID := strings.TrimSpace(client.AdditionalProperties.LicenseServerID)
-					if serverID == "" && len(serverByID) == 1 {
-						for onlyID := range serverByID {
-							serverID = onlyID
-							break
-						}
-					}
-					if serverID == "" {
-						continue
-					}
-
-					server := serverByID[serverID]
-					serverName := firstNonEmptyNonBlank(client.AdditionalProperties.LicenseServerName, server.Name)
-					if serverName == "" {
-						serverName = "unknown"
-					}
-
-					for _, lease := range client.Leases {
-						leaseCount := lease.LeaseCount
-						if leaseCount <= 0 {
-							leaseCount = 1
-						}
-
-						feature := featureByAllotmentID[lease.LicenseAllotmentFeatureID]
-						featureName := firstNonEmptyNonBlank(lease.FeatureName, feature.FeatureName)
-						productName := firstNonEmptyNonBlank(feature.ProductName, "unknown")
-						licenseType := firstNonEmptyNonBlank(feature.LicenseType, "unknown")
-
-						key := activeFeatureKey{
-							virtualGroupID:   virtualGroupID,
-							virtualGroupName: firstNonEmptyNonBlank(server.VirtualGroupName, virtualGroupName),
-							serverID:         serverID,
-							serverName:       serverName,
-							featureName:      firstNonEmptyNonBlank(featureName, "unknown"),
-							productName:      productName,
-							licenseType:      licenseType,
-						}
-
-						leaseID := strings.TrimSpace(lease.LeaseID)
-						mu.Lock()
-						if leaseID != "" {
-							if _, exists := seenLeaseIDs[leaseID]; exists {
-								mu.Unlock()
-								continue
-							}
-							seenLeaseIDs[leaseID] = struct{}{}
-						}
-						serverTotals[serverID] += leaseCount
-						featureTotals[key] += leaseCount
-						total += leaseCount
-						mu.Unlock()
-					}
-				}
-				return nil
-			})
-		}
-	}
-
-	if err := activeGroup.Wait(); err != nil {
-		return nil, nil, nil, 0, err
-	}
-
-	serverSnapshots := make([]ServerActiveLeaseSnapshot, 0, len(serverTotals))
-	for virtualGroupID, servers := range serversByVG {
-		for _, server := range servers {
-			count, ok := serverTotals[server.ID]
-			if !ok {
-				continue
-			}
-			serverSnapshots = append(serverSnapshots, ServerActiveLeaseSnapshot{
-				VirtualGroupID:   virtualGroupID,
-				VirtualGroupName: server.VirtualGroupName,
-				ServerID:         server.ID,
-				ServerName:       server.Name,
-				ActiveLeases:     count,
-			})
-		}
-	}
-
-	featureSnapshots := make([]ServerFeatureActiveLeaseSnapshot, 0, len(featureTotals))
-	for key, count := range featureTotals {
-		featureSnapshots = append(featureSnapshots, ServerFeatureActiveLeaseSnapshot{
-			VirtualGroupID:   key.virtualGroupID,
-			VirtualGroupName: key.virtualGroupName,
-			ServerID:         key.serverID,
-			ServerName:       key.serverName,
-			FeatureName:      key.featureName,
-			ProductName:      key.productName,
-			LicenseType:      key.licenseType,
-			ActiveLeases:     count,
-		})
-	}
-
-	return serverTotals, serverSnapshots, featureSnapshots, total, nil
 }
 
 func extractEntitlementFeatureMetrics(virtualGroups []virtualGroup) []EntitlementFeatureSnapshot {
@@ -493,47 +225,85 @@ func (c *Client) listVirtualGroups(ctx context.Context) ([]virtualGroup, error) 
 	return resp.VirtualGroups, nil
 }
 
-func (c *Client) listLicenseServers(ctx context.Context, virtualGroupID int) ([]licenseServer, error) {
-	endpoint := fmt.Sprintf(
-		"%s/v1/org/%s/virtual-groups/%d/license-servers",
-		c.baseURL,
-		url.PathEscape(c.orgName),
-		virtualGroupID,
-	)
-	var resp licenseServersResponse
-	if err := c.doJSON(ctx, http.MethodGet, endpoint, &resp, ""); err != nil {
+// listAllocations walks the paginated allocations of a virtual group. The
+// virtual group is filled in when the API omits it from an allocation.
+func (c *Client) listAllocations(ctx context.Context, vg virtualGroup) ([]allocation, error) {
+	base := fmt.Sprintf("%s/v1/org/%s/virtual-groups/%d/allocations", c.baseURL, url.PathEscape(c.orgName), vg.ID)
+	seen := make(map[string]struct{})
+	allocations := make([]allocation, 0)
+	err := listPages(ctx, c, func(page int) string {
+		query := url.Values{"page-number": {strconv.Itoa(page)}}
+		return base + "?" + query.Encode()
+	}, "", func(resp allocationsResponse) {
+		for _, a := range resp.Allocations {
+			if _, ok := seen[a.ID]; ok {
+				continue
+			}
+			seen[a.ID] = struct{}{}
+			if a.VirtualGroupID == 0 {
+				a.VirtualGroupID = vg.ID
+			}
+			if a.VirtualGroupName == "" {
+				a.VirtualGroupName = vg.Name
+			}
+			allocations = append(allocations, a)
+		}
+	})
+	if err != nil {
 		return nil, err
 	}
-	return resp.LicenseServers, nil
+	return allocations, nil
 }
 
-func (c *Client) listLicensePools(ctx context.Context, virtualGroupID int, serverID string) ([]licensePool, error) {
-	endpoint := fmt.Sprintf(
-		"%s/v1/org/%s/virtual-groups/%d/license-servers/%s/license-pools",
-		c.baseURL,
-		url.PathEscape(c.orgName),
-		virtualGroupID,
-		url.PathEscape(serverID),
-	)
-	var resp licensePoolsResponse
-	if err := c.doJSON(ctx, http.MethodGet, endpoint, &resp, ""); err != nil {
+// listAllocationLeases walks the paginated active leases of one allocation.
+// The leases endpoint is scoped by the service instance header, and the
+// license_server_ids filter attributes the leases to this allocation. An
+// allocation without a service instance has no clients and no leases.
+func (c *Client) listAllocationLeases(ctx context.Context, a allocation) ([]lease, error) {
+	serviceInstanceID := firstNonEmptyNonBlank(a.ServiceInstanceID, c.serviceInstanceID)
+	if serviceInstanceID == "" {
+		return nil, nil
+	}
+	base := fmt.Sprintf("%s/v1/org/%s/virtual-groups/%d/leases", c.baseURL, url.PathEscape(c.orgName), a.VirtualGroupID)
+	leases := make([]lease, 0)
+	err := listPages(ctx, c, func(page int) string {
+		query := url.Values{
+			"license_server_ids": {a.ID},
+			"page_number":        {strconv.Itoa(page)},
+		}
+		return base + "?" + query.Encode()
+	}, serviceInstanceID, func(resp leasesResponse) {
+		for _, client := range resp.Clients {
+			leases = append(leases, client.Leases...)
+		}
+	})
+	if err != nil {
 		return nil, err
 	}
-	return resp.LicensePools, nil
+	return leases, nil
 }
 
-func (c *Client) listActiveLeases(ctx context.Context, virtualGroupID int, serviceInstanceID string) ([]activeLeaseClient, error) {
-	endpoint := fmt.Sprintf(
-		"%s/v1/org/%s/virtual-groups/%d/leases/all",
-		c.baseURL,
-		url.PathEscape(c.orgName),
-		virtualGroupID,
-	)
-	var resp activeLeasesResponse
-	if err := c.doJSON(ctx, http.MethodGet, endpoint, &resp, serviceInstanceID); err != nil {
-		return nil, err
+type pagedResponse interface {
+	pagination() paginationInfo
+}
+
+// listPages visits every page of a listing, in order, until the API reports
+// the last page. A listing that never ends is an error rather than a partial
+// snapshot presented as complete.
+func listPages[T pagedResponse](ctx context.Context, c *Client, pageURL func(page int) string, serviceInstanceID string, visit func(T)) error {
+	for page := 0; ; page++ {
+		if page >= maxPages {
+			return fmt.Errorf("listing exceeded %d pages", maxPages)
+		}
+		var resp T
+		if err := c.doJSON(ctx, http.MethodGet, pageURL(page), &resp, serviceInstanceID); err != nil {
+			return err
+		}
+		visit(resp)
+		if page+1 >= resp.pagination().TotalPages {
+			return nil
+		}
 	}
-	return resp.decodeClients()
 }
 
 func (c *Client) doJSON(ctx context.Context, method, endpoint string, out any, serviceInstanceID string) error {
@@ -544,12 +314,8 @@ func (c *Client) doJSON(ctx context.Context, method, endpoint string, out any, s
 	req.Header.Set("x-api-key", c.apiKey)
 	req.Header.Set("accept", defaultContentTypeHeader)
 	req.Header.Set("user-agent", defaultUserAgent)
-	headerServiceInstanceID := strings.TrimSpace(serviceInstanceID)
-	if headerServiceInstanceID == "" {
-		headerServiceInstanceID = c.serviceInstanceID
-	}
-	if headerServiceInstanceID != "" {
-		req.Header.Set("x-nv-service-instance-id", headerServiceInstanceID)
+	if serviceInstanceID != "" {
+		req.Header.Set("x-nv-service-instance-id", serviceInstanceID)
 	}
 
 	resp, err := c.httpClient.Do(req)
@@ -559,7 +325,7 @@ func (c *Client) doJSON(ctx context.Context, method, endpoint string, out any, s
 	defer resp.Body.Close()
 
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
-		return fmt.Errorf("request %s failed with status %d", endpoint, resp.StatusCode)
+		return fmt.Errorf("request %s failed with status %d: %s", endpoint, resp.StatusCode, errorBody(resp.Body))
 	}
 
 	if err := json.NewDecoder(resp.Body).Decode(out); err != nil {
@@ -568,15 +334,19 @@ func (c *Client) doJSON(ctx context.Context, method, endpoint string, out any, s
 	return nil
 }
 
-func (c *Client) OrgName() string {
-	return c.orgName
+// errorBody keeps a bounded, single-line excerpt of a failed response so the
+// cause, such as a retired endpoint, is visible in the error.
+func errorBody(body io.Reader) string {
+	raw, _ := io.ReadAll(io.LimitReader(body, maxErrorBodyBytes))
+	excerpt := strings.Join(strings.Fields(string(raw)), " ")
+	if excerpt == "" {
+		return "empty response body"
+	}
+	return excerpt
 }
 
-func maxFloat64(a, b float64) float64 {
-	if a > b {
-		return a
-	}
-	return b
+func (c *Client) OrgName() string {
+	return c.orgName
 }
 
 type virtualGroupsResponse struct {
@@ -609,23 +379,33 @@ type entitlementFeature struct {
 	UnassignedQuantity float64 `json:"unassignedQuantity"`
 }
 
-type licenseServersResponse struct {
-	LicenseServers []licenseServer `json:"licenseServers"`
+type paginationInfo struct {
+	Index      int `json:"index"`
+	TotalPages int `json:"totalPages"`
 }
 
-type licenseServer struct {
-	ID                    string                 `json:"id"`
-	Name                  string                 `json:"name"`
-	Status                string                 `json:"status"`
-	VirtualGroupID        int                    `json:"virtualGroupId"`
-	VirtualGroupName      string                 `json:"virtualGroupName"`
-	DeployedOn            string                 `json:"deployedOn"`
-	LeasingMode           string                 `json:"leasingMode"`
-	ServiceInstanceID     string                 `json:"serviceInstanceId"`
-	LicenseServerFeatures []licenseServerFeature `json:"licenseServerFeatures"`
+type allocationsResponse struct {
+	Allocations    []allocation   `json:"allocations"`
+	PaginationInfo paginationInfo `json:"paginationInfo"`
 }
 
-type licenseServerFeature struct {
+func (r allocationsResponse) pagination() paginationInfo {
+	return r.PaginationInfo
+}
+
+type allocation struct {
+	ID                 string              `json:"id"`
+	Name               string              `json:"name"`
+	Status             string              `json:"status"`
+	VirtualGroupID     int                 `json:"virtualGroupId"`
+	VirtualGroupName   string              `json:"virtualGroupName"`
+	DeployedOn         string              `json:"deployedOn"`
+	LeasingMode        string              `json:"leasingMode"`
+	ServiceInstanceID  string              `json:"serviceInstanceId"`
+	AllocationFeatures []allocationFeature `json:"allocationFeatures"`
+}
+
+type allocationFeature struct {
 	ID            string  `json:"id"`
 	FeatureName   string  `json:"featureName"`
 	ProductName   string  `json:"productName"`
@@ -633,62 +413,105 @@ type licenseServerFeature struct {
 	TotalQuantity float64 `json:"totalQuantity"`
 }
 
-type licensePoolsResponse struct {
-	LicensePools []licensePool `json:"licensePools"`
-}
-
-type licensePool struct {
-	ID                  string               `json:"id"`
-	Name                string               `json:"name"`
-	LicensePoolFeatures []licensePoolFeature `json:"licensePoolFeatures"`
-}
-
-type licensePoolFeature struct {
-	LicenseServerFeatureID string  `json:"licenseServerFeatureId"`
-	TotalAllotment         float64 `json:"totalAllotment"`
-	InUse                  float64 `json:"inUse"`
-}
-
-type activeLeasesResponse struct {
-	Clients           []activeLeaseClient `json:"clients"`
-	CompressedClients string              `json:"compressedClients"`
-}
-
-func (r *activeLeasesResponse) decodeClients() ([]activeLeaseClient, error) {
-	if r.CompressedClients == "" {
-		return r.Clients, nil
+func (a allocation) info() ServerInfoSnapshot {
+	return ServerInfoSnapshot{
+		VirtualGroupID:   a.VirtualGroupID,
+		VirtualGroupName: a.VirtualGroupName,
+		ServerID:         a.ID,
+		ServerName:       a.Name,
+		ServerStatus:     a.Status,
+		DeployedOn:       a.DeployedOn,
+		LeasingMode:      a.LeasingMode,
 	}
-	decoded := base64.NewDecoder(base64.StdEncoding, strings.NewReader(r.CompressedClients))
-	gz, err := gzip.NewReader(decoded)
-	if err != nil {
-		return nil, fmt.Errorf("open compressedClients gzip: %w", err)
-	}
-	defer gz.Close()
-
-	var payload struct {
-		Clients []activeLeaseClient `json:"clients"`
-	}
-	if err := json.NewDecoder(gz).Decode(&payload); err != nil {
-		return nil, fmt.Errorf("decode compressedClients: %w", err)
-	}
-	return payload.Clients, nil
 }
 
-type activeLeaseClient struct {
-	Leases               []activeLease                   `json:"leases"`
-	AdditionalProperties activeLeaseAdditionalProperties `json:"additionalProperties"`
+func (a allocation) featureCapacity() []ServerFeatureCapacitySnapshot {
+	capacity := make([]ServerFeatureCapacitySnapshot, 0, len(a.AllocationFeatures))
+	for _, feature := range a.AllocationFeatures {
+		capacity = append(capacity, ServerFeatureCapacitySnapshot{
+			VirtualGroupID:   a.VirtualGroupID,
+			VirtualGroupName: a.VirtualGroupName,
+			ServerID:         a.ID,
+			ServerName:       a.Name,
+			FeatureName:      feature.FeatureName,
+			ProductName:      feature.ProductName,
+			LicenseType:      feature.LicenseType,
+			TotalQuantity:    feature.TotalQuantity,
+		})
+	}
+	return capacity
 }
 
-type activeLease struct {
-	LeaseID                   string  `json:"leaseId"`
-	FeatureName               string  `json:"featureName"`
-	LeaseCount                float64 `json:"leaseCount"`
-	LicenseAllotmentFeatureID string  `json:"licenseAllotmentFeatureId"`
+type activeFeatureKey struct {
+	featureName string
+	productName string
+	licenseType string
 }
 
-type activeLeaseAdditionalProperties struct {
-	LicenseServerID   string `json:"license_server_id"`
-	LicenseServerName string `json:"license_server_name"`
+// featureActiveLeases counts leases per allocation feature. A lease ID can
+// repeat across pages, so each is counted once.
+func (a allocation) featureActiveLeases(leases []lease) []ServerFeatureActiveLeaseSnapshot {
+	featureByID := make(map[string]allocationFeature, len(a.AllocationFeatures))
+	for _, feature := range a.AllocationFeatures {
+		featureByID[feature.ID] = feature
+	}
+
+	seen := make(map[string]struct{}, len(leases))
+	counts := make(map[activeFeatureKey]float64)
+	order := make([]activeFeatureKey, 0)
+	for _, l := range leases {
+		leaseID := strings.TrimSpace(l.LeaseID)
+		if leaseID != "" {
+			if _, ok := seen[leaseID]; ok {
+				continue
+			}
+			seen[leaseID] = struct{}{}
+		}
+		feature := featureByID[l.LicenseAllotmentFeatureID]
+		key := activeFeatureKey{
+			featureName: firstNonEmptyNonBlank(l.FeatureName, feature.FeatureName, "unknown"),
+			productName: firstNonEmptyNonBlank(feature.ProductName, "unknown"),
+			licenseType: firstNonEmptyNonBlank(feature.LicenseType, "unknown"),
+		}
+		if _, ok := counts[key]; !ok {
+			order = append(order, key)
+		}
+		counts[key]++
+	}
+
+	snapshots := make([]ServerFeatureActiveLeaseSnapshot, 0, len(order))
+	for _, key := range order {
+		snapshots = append(snapshots, ServerFeatureActiveLeaseSnapshot{
+			VirtualGroupID:   a.VirtualGroupID,
+			VirtualGroupName: a.VirtualGroupName,
+			ServerID:         a.ID,
+			ServerName:       a.Name,
+			FeatureName:      key.featureName,
+			ProductName:      key.productName,
+			LicenseType:      key.licenseType,
+			ActiveLeases:     counts[key],
+		})
+	}
+	return snapshots
+}
+
+type leasesResponse struct {
+	Clients        []leaseClient  `json:"clients"`
+	PaginationInfo paginationInfo `json:"paginationInfo"`
+}
+
+func (r leasesResponse) pagination() paginationInfo {
+	return r.PaginationInfo
+}
+
+type leaseClient struct {
+	Leases []lease `json:"leases"`
+}
+
+type lease struct {
+	LeaseID                   string `json:"leaseId"`
+	FeatureName               string `json:"featureName"`
+	LicenseAllotmentFeatureID string `json:"licenseAllotmentFeatureId"`
 }
 
 func firstNonEmptyNonBlank(values ...string) string {

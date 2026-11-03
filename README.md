@@ -14,6 +14,16 @@ The exporter is intentionally scoped to CLS only (no DLS support).
 Optional:
 - Service instance ID (`x-nv-service-instance-id`) for environments that require it
 
+## NVIDIA API endpoints
+
+The exporter reads the supported listing endpoints of the NVIDIA Licensing Portal API:
+
+- `GET /v1/org/{org}/virtual-groups` for entitlement features
+- `GET /v1/org/{org}/virtual-groups/{vg}/allocations` (paginated) for license servers and their features
+- `GET /v1/org/{org}/virtual-groups/{vg}/leases` (paginated, filtered by `license_server_ids`, scoped by `X-NV-SERVICE-INSTANCE-ID`) for active leases
+
+NVIDIA retired `.../license-servers/{id}/license-pools` (it now answers HTTP 400 "This API is no longer supported") and deprecated `.../license-servers` in favor of allocations; neither is used.
+
 ## Configuration
 
 ### CLS and server
@@ -38,6 +48,7 @@ If `LISTEN_ADDRESS` is unset and `PORT` is set (for example on Railway), the exp
 - `OTEL_SERVICE_INSTANCE_ID` (optional, default hostname)
 - `OTEL_INSECURE` (optional, default `true`)
 - `OTEL_PUSH_INTERVAL` (optional, default `60s`)
+- `OTEL_RESOURCE_ATTRIBUTES` (optional, standard OpenTelemetry resource attributes such as `deployment.environment=production`)
 
 Flags are also available in `-kebab-case` (for example `-otel-enabled`, `-otel-endpoint`).
 
@@ -61,7 +72,10 @@ Prometheus pull and OTEL push use the same snapshot cache.
 
 - If cache is fresh (`CACHE_TTL`), no CLS API call is made.
 - If cache is stale, one refresh call updates cache for both pull and push.
-- If refresh fails and a stale snapshot exists, stale data is still emitted with `nvidia_cls_up=0`.
+- If refresh fails and a stale snapshot exists, stale data is still emitted with `nvidia_cls_up=0` and `nvidia_cls_scrape_timestamp_seconds` keeps the last successful collection time.
+- If refresh fails before any snapshot exists, `nvidia_cls_up=0` and `nvidia_cls_scrape_duration_seconds` are still emitted; the timestamp and data metrics appear once a snapshot is collected.
+
+`/healthz` only reports that the process serves HTTP. Alert on `nvidia_cls_up` for collection health.
 
 Recommended default:
 - `CACHE_TTL=60s`

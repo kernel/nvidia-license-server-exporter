@@ -155,6 +155,13 @@ func TestServiceRefreshErrorWithoutCache(t *testing.T) {
 	if err == nil {
 		t.Fatalf("expected error when no cache exists")
 	}
+	snap, meta, ok := svc.Latest()
+	if ok || snap != nil {
+		t.Fatalf("expected no snapshot after failed cold start, got %+v", snap)
+	}
+	if meta.Up != 0 || !meta.Timestamp.IsZero() {
+		t.Fatalf("expected down without a snapshot timestamp, got %+v", meta)
+	}
 }
 
 func TestServiceRefreshSingleflight(t *testing.T) {

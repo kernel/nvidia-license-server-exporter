@@ -175,7 +175,7 @@ func (c *Collector) Collect(ch chan<- prometheus.Metric) {
 		ch <- prometheus.MustNewConstMetric(c.serverFeatureActiveDesc, prometheus.GaugeValue, item.ActiveLeases, labels...)
 	}
 
-	for _, item := range snapshot.ServerUsage {
+	for _, item := range snapshot.ServerInfo {
 		infoLabels := []string{
 			strconv.Itoa(item.VirtualGroupID),
 			safeLabel(item.VirtualGroupName),
