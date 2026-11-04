@@ -2,10 +2,13 @@ package otel
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
 	"go.opentelemetry.io/otel/attribute"
+	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
+	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 	"nvidia-license-server-exporter/internal/cls"
 	"nvidia-license-server-exporter/internal/snapshot"
 )
@@ -17,6 +20,22 @@ func TestNormalizeConfigDefaults(t *testing.T) {
 	}
 	if cfg.RefreshTimeout != defaultRefreshTimeout {
 		t.Fatalf("expected default refresh timeout %s, got %s", defaultRefreshTimeout, cfg.RefreshTimeout)
+	}
+}
+
+func TestNewResourceHonorsEnvironmentAttributes(t *testing.T) {
+	t.Setenv("OTEL_RESOURCE_ATTRIBUTES", "deployment.environment=production,service.name=ignored")
+
+	res, err := newResource(context.Background(), Config{ServiceName: "svc", ServiceInstanceID: "task-1"})
+	if err != nil {
+		t.Fatalf("new resource: %v", err)
+	}
+	attrs := attrMap(res.Attributes())
+	if attrs["deployment.environment"] != "production" {
+		t.Fatalf("deployment.environment = %q, want production", attrs["deployment.environment"])
+	}
+	if attrs["service.name"] != "svc" || attrs["service.instance.id"] != "task-1" {
+		t.Fatalf("configured service identity must win: %v", attrs)
 	}
 }
 
@@ -67,7 +86,7 @@ func TestBuildObservationsMapping(t *testing.T) {
 				ActiveLeases:     19,
 			},
 		},
-		ServerUsage: []cls.ServerUsageSnapshot{
+		ServerInfo: []cls.ServerInfoSnapshot{
 			{
 				VirtualGroupID:   101,
 				VirtualGroupName: "VG",
@@ -111,6 +130,94 @@ func TestBuildObservationsMapping(t *testing.T) {
 		counts[metricServerInfo] != 1 {
 		t.Fatalf("unexpected observation counts: %+v", counts)
 	}
+}
+
+func TestBuildObservationsWithoutSnapshot(t *testing.T) {
+	obs := buildObservations("org-1", nil, snapshot.Meta{DurationSeconds: 0.5})
+
+	values := make(map[string]float64, len(obs))
+	for _, o := range obs {
+		values[o.name] = o.value
+	}
+	if len(values) != 2 || values[metricScrapeDuration] != 0.5 {
+		t.Fatalf("observations without a snapshot = %v, want only health", values)
+	}
+	if up, ok := values[metricUp]; !ok || up != 0 {
+		t.Fatalf("up = %v, want 0", values[metricUp])
+	}
+}
+
+func TestBuildObservationsStaleSnapshotKeepsTimestamp(t *testing.T) {
+	collected := time.Unix(1700000000, 0).UTC()
+	obs := buildObservations("org-1", &cls.Snapshot{CollectedAt: collected}, snapshot.Meta{Up: 0, Timestamp: collected})
+
+	values := make(map[string]float64, len(obs))
+	for _, o := range obs {
+		values[o.name] = o.value
+	}
+	if values[metricUp] != 0 || values[metricScrapeTimestamp] != float64(collected.Unix()) {
+		t.Fatalf("stale observations = %v, want down with the last collection time", values)
+	}
+}
+
+type flakyFetcher struct {
+	fail bool
+}
+
+func (f *flakyFetcher) FetchSnapshot(context.Context) (*cls.Snapshot, error) {
+	if f.fail {
+		return nil, errors.New("request failed with status 400")
+	}
+	return &cls.Snapshot{CollectedAt: time.Now().UTC()}, nil
+}
+
+func TestRegisteredMetricsReportFailedColdStart(t *testing.T) {
+	ctx := context.Background()
+	fetcher := &flakyFetcher{fail: true}
+	svc := snapshot.NewService(fetcher, time.Minute)
+	reader := sdkmetric.NewManualReader()
+	provider := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+	defer func() { _ = provider.Shutdown(ctx) }()
+
+	pusher := &MetricsPusher{orgName: "org-1", snapshotSvc: svc}
+	if err := pusher.registerMetrics(provider.Meter("test")); err != nil {
+		t.Fatalf("register metrics: %v", err)
+	}
+
+	pusher.refreshOnce()
+	gauges := collectGauges(t, ctx, reader)
+	if up, ok := gauges[metricUp]; !ok || up != 0 {
+		t.Fatalf("failed cold start must report up=0, got %v", gauges)
+	}
+	if _, ok := gauges[metricScrapeTimestamp]; ok {
+		t.Fatalf("failed cold start must not report a snapshot timestamp: %v", gauges)
+	}
+
+	fetcher.fail = false
+	pusher.refreshOnce()
+	gauges = collectGauges(t, ctx, reader)
+	if gauges[metricUp] != 1 || gauges[metricScrapeTimestamp] == 0 {
+		t.Fatalf("recovered collection must report up=1 with a timestamp, got %v", gauges)
+	}
+}
+
+func collectGauges(t *testing.T, ctx context.Context, reader *sdkmetric.ManualReader) map[string]float64 {
+	t.Helper()
+	var rm metricdata.ResourceMetrics
+	if err := reader.Collect(ctx, &rm); err != nil {
+		t.Fatalf("collect: %v", err)
+	}
+	gauges := make(map[string]float64)
+	for _, scope := range rm.ScopeMetrics {
+		for _, m := range scope.Metrics {
+			gauge, ok := m.Data.(metricdata.Gauge[float64])
+			if !ok || len(gauge.DataPoints) != 1 {
+				t.Fatalf("metric %s: unexpected data %+v", m.Name, m.Data)
+			}
+			gauges[m.Name] = gauge.DataPoints[0].Value
+		}
+	}
+	return gauges
 }
 
 func TestNewMetricsPusherValidation(t *testing.T) {

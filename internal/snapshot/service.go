@@ -108,8 +108,6 @@ func (s *Service) Refresh(ctx context.Context) (*cls.Snapshot, Meta, error) {
 		s.meta = Meta{
 			Up:              0,
 			DurationSeconds: duration,
-			Timestamp:       now,
-			CacheHit:        false,
 		}
 		return nil, fetchErr
 	})
@@ -121,14 +119,13 @@ func (s *Service) Refresh(ctx context.Context) (*cls.Snapshot, Meta, error) {
 	return res.snapshot, res.meta, nil
 }
 
+// Latest returns the cached snapshot, if any, and the state of the most recent
+// refresh. The meta is meaningful before a snapshot exists so a failing cold
+// start is still reported as down.
 func (s *Service) Latest() (*cls.Snapshot, Meta, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-
-	if s.snapshot == nil {
-		return nil, Meta{}, false
-	}
-	return s.snapshot, s.meta, true
+	return s.snapshot, s.meta, s.snapshot != nil
 }
 
 func (s *Service) Meta() Meta {
