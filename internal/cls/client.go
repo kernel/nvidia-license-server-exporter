@@ -217,12 +217,25 @@ func extractEntitlementFeatureMetrics(virtualGroups []virtualGroup) []Entitlemen
 }
 
 func (c *Client) listVirtualGroups(ctx context.Context) ([]virtualGroup, error) {
-	endpoint := fmt.Sprintf("%s/v1/org/%s/virtual-groups", c.baseURL, url.PathEscape(c.orgName))
-	var resp virtualGroupsResponse
-	if err := c.doJSON(ctx, http.MethodGet, endpoint, &resp, ""); err != nil {
+	base := fmt.Sprintf("%s/v1/org/%s/virtual-groups", c.baseURL, url.PathEscape(c.orgName))
+	seen := make(map[int]struct{})
+	virtualGroups := make([]virtualGroup, 0)
+	err := listPages(ctx, c, func(page int) string {
+		query := url.Values{"page-number": {strconv.Itoa(page)}}
+		return base + "?" + query.Encode()
+	}, "", func(resp virtualGroupsResponse) {
+		for _, vg := range resp.VirtualGroups {
+			if _, ok := seen[vg.ID]; ok {
+				continue
+			}
+			seen[vg.ID] = struct{}{}
+			virtualGroups = append(virtualGroups, vg)
+		}
+	})
+	if err != nil {
 		return nil, err
 	}
-	return resp.VirtualGroups, nil
+	return virtualGroups, nil
 }
 
 // listAllocations walks the paginated allocations of a virtual group. The
@@ -257,15 +270,20 @@ func (c *Client) listAllocations(ctx context.Context, vg virtualGroup) ([]alloca
 
 // listAllocationLeases walks the paginated active leases of one CLS allocation.
 // A configured service instance fills in missing binding metadata; it does not
-// override an allocation's type or deployment.
+// override an allocation's type or deployment. NVIDIA omits the binding when a
+// license file has been generated for the allocation, so the fallback does not
+// apply to those.
 func (c *Client) listAllocationLeases(ctx context.Context, a allocation) ([]lease, error) {
-	if a.Type == "MELLANOX" || a.Type == "BRIGHT" {
+	if a.Type != "" && a.Type != "NVIDIA" {
 		return nil, nil
 	}
 	if a.DeployedOn != "" && a.DeployedOn != "CLOUD" {
 		return nil, nil
 	}
-	serviceInstanceID := firstNonEmptyNonBlank(a.ServiceInstanceID, c.serviceInstanceID)
+	serviceInstanceID := strings.TrimSpace(a.ServiceInstanceID)
+	if serviceInstanceID == "" && a.ArtifactType == "" {
+		serviceInstanceID = c.serviceInstanceID
+	}
 	if serviceInstanceID == "" {
 		return nil, nil
 	}
@@ -334,7 +352,7 @@ func (c *Client) doJSON(ctx context.Context, method, endpoint string, out any, s
 		return fmt.Errorf("request %s failed with status %d", endpoint, resp.StatusCode)
 	}
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
-		return fmt.Errorf("request %s failed with status %d: %s", endpoint, resp.StatusCode, errorBody(resp.Body))
+		return fmt.Errorf("request %s failed with status %d: %s", endpoint, resp.StatusCode, errorBody(resp.Body, c.apiKey))
 	}
 
 	if err := json.NewDecoder(resp.Body).Decode(out); err != nil {
@@ -344,10 +362,18 @@ func (c *Client) doJSON(ctx context.Context, method, endpoint string, out any, s
 }
 
 // errorBody keeps a bounded, single-line excerpt of a failed response so the
-// cause, such as a retired endpoint, is visible in the error.
-func errorBody(body io.Reader) string {
-	raw, _ := io.ReadAll(io.LimitReader(body, maxErrorBodyBytes))
-	excerpt := strings.Join(strings.Fields(string(raw)), " ")
+// cause, such as a retired endpoint, is visible in the error. The API key is
+// redacted before truncation so a key at the cut-off is not partially kept.
+func errorBody(body io.Reader, apiKey string) string {
+	raw, _ := io.ReadAll(io.LimitReader(body, int64(maxErrorBodyBytes+len(apiKey))))
+	text := string(raw)
+	if apiKey != "" {
+		text = strings.ReplaceAll(text, apiKey, "[redacted]")
+	}
+	if len(text) > maxErrorBodyBytes {
+		text = text[:maxErrorBodyBytes]
+	}
+	excerpt := strings.Join(strings.Fields(text), " ")
 	if excerpt == "" {
 		return "empty response body"
 	}
@@ -359,7 +385,12 @@ func (c *Client) OrgName() string {
 }
 
 type virtualGroupsResponse struct {
-	VirtualGroups []virtualGroup `json:"virtualGroups"`
+	VirtualGroups  []virtualGroup `json:"virtualGroups"`
+	PaginationInfo paginationInfo `json:"paginationInfo"`
+}
+
+func (r virtualGroupsResponse) pagination() paginationInfo {
+	return r.PaginationInfo
 }
 
 type virtualGroup struct {
@@ -412,6 +443,7 @@ type allocation struct {
 	DeployedOn         string              `json:"deployedOn"`
 	LeasingMode        string              `json:"leasingMode"`
 	ServiceInstanceID  string              `json:"serviceInstanceId"`
+	ArtifactType       string              `json:"artifactType"`
 	AllocationFeatures []allocationFeature `json:"allocationFeatures"`
 }
 
@@ -479,7 +511,7 @@ func (a allocation) featureActiveLeases(leases []lease) []ServerFeatureActiveLea
 		}
 		feature := featureByID[l.LicenseAllotmentFeatureID]
 		key := activeFeatureKey{
-			featureName: firstNonEmptyNonBlank(l.FeatureName, feature.FeatureName, "unknown"),
+			featureName: firstNonEmptyNonBlank(feature.FeatureName, l.FeatureName, "unknown"),
 			productName: firstNonEmptyNonBlank(feature.ProductName, "unknown"),
 			licenseType: firstNonEmptyNonBlank(feature.LicenseType, "unknown"),
 		}

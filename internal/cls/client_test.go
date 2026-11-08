@@ -30,6 +30,10 @@ type fakeCLS struct {
 	leases map[string][]string
 	// allocationPages overrides the default two allocation pages.
 	allocationPages []string
+	// virtualGroupPages overrides the default single virtual-group page.
+	virtualGroupPages []string
+	// forbidden answers every request with a 403 that echoes the API key.
+	forbidden bool
 }
 
 func (f *fakeCLS) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -41,10 +45,20 @@ func (f *fakeCLS) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, fmt.Sprintf(`{"message":"Invalid api-key %s"}`, r.Header.Get("x-api-key")), http.StatusUnauthorized)
 		return
 	}
+	if f.forbidden {
+		http.Error(w, fmt.Sprintf(`{"message":"api-key %s is not authorized"}`, r.Header.Get("x-api-key")), http.StatusForbidden)
+		return
+	}
 	w.Header().Set("Content-Type", "application/json")
 	switch r.URL.Path {
 	case "/v1/org/lic-test/virtual-groups":
-		_, _ = w.Write([]byte(virtualGroupsBody))
+		pages := f.virtualGroupPages
+		if pages == nil {
+			pages = []string{virtualGroupsBody}
+		}
+		_, _ = w.Write([]byte(pages[pageIndex(r.URL.Query().Get("page-number"), len(pages))]))
+	case "/v1/org/lic-test/virtual-groups/43/allocations":
+		_, _ = w.Write([]byte(`{"allocations":[],"paginationInfo":{"index":0,"totalPages":1}}`))
 	case "/v1/org/lic-test/virtual-groups/42/allocations":
 		pages := f.allocationPages
 		if pages == nil {
@@ -118,7 +132,7 @@ func TestFetchSnapshotUsesSupportedEndpoints(t *testing.T) {
 		}
 	}
 	wantPaths := []string{
-		"/v1/org/lic-test/virtual-groups",
+		"/v1/org/lic-test/virtual-groups?page-number=0",
 		"/v1/org/lic-test/virtual-groups/42/allocations?page-number=0",
 		"/v1/org/lic-test/virtual-groups/42/allocations?page-number=1",
 		"/v1/org/lic-test/virtual-groups/42/leases?license_server_ids=alloc-1&page_number=0",
@@ -210,15 +224,19 @@ func TestFetchSnapshotSkipsNonCLSLeases(t *testing.T) {
 		allocationType    string
 		deployedOn        string
 		serviceInstanceID string
+		artifactType      string
 	}{
 		{name: "undeployed", allocationType: "NVIDIA", deployedOn: "NOT_DEPLOYED"},
 		{name: "not applicable", allocationType: "NVIDIA", deployedOn: "NOT_APPLICABLE"},
 		{name: "on premises", allocationType: "NVIDIA", deployedOn: "ON_PREM", serviceInstanceID: "si-dls"},
 		{name: "mellanox", allocationType: "MELLANOX"},
 		{name: "bright", allocationType: "BRIGHT"},
+		{name: "flexera", allocationType: "FLEXERA", deployedOn: "CLOUD", serviceInstanceID: "si-legacy"},
+		{name: "network license file", allocationType: "NVIDIA", artifactType: "NETWORK_LICENSE_FILE"},
+		{name: "node-locked license file", allocationType: "NVIDIA", artifactType: "NLL_FILE"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			fake := &fakeCLS{allocationPages: []string{fmt.Sprintf(`{"allocations":[{"id":"alloc-2","type":%q,"deployedOn":%q,"serviceInstanceId":%q,"allocationFeatures":[{"id":"af-1","featureName":"Feature","productName":"Product","licenseType":"CONCURRENT_COUNTED_SINGLE","totalQuantity":10}]}],"paginationInfo":{"totalPages":1}}`, tc.allocationType, tc.deployedOn, tc.serviceInstanceID)}}
+			fake := &fakeCLS{allocationPages: []string{fmt.Sprintf(`{"allocations":[{"id":"alloc-2","type":%q,"deployedOn":%q,"serviceInstanceId":%q,"artifactType":%q,"allocationFeatures":[{"id":"af-1","featureName":"Feature","productName":"Product","licenseType":"CONCURRENT_COUNTED_SINGLE","totalQuantity":10}]}],"paginationInfo":{"totalPages":1}}`, tc.allocationType, tc.deployedOn, tc.serviceInstanceID, tc.artifactType)}}
 			client := newTestClient(t, fake, Config{ServiceInstanceID: "si-default"})
 
 			snap, err := client.FetchSnapshot(context.Background())
@@ -235,6 +253,74 @@ func TestFetchSnapshotSkipsNonCLSLeases(t *testing.T) {
 				t.Fatalf("expected only virtual-group and allocation requests, got %v", paths)
 			}
 		})
+	}
+}
+
+func TestFetchSnapshotUsesBoundServiceInstanceOfArtifactAllocation(t *testing.T) {
+	fake := &fakeCLS{
+		allocationPages: []string{`{"allocations":[{"id":"alloc-1","type":"NVIDIA","artifactType":"LEGACY_CLOUD_NLL_FILE","serviceInstanceId":"si-bound","allocationFeatures":[]}],"paginationInfo":{"index":0,"totalPages":1}}`},
+		leases:          map[string][]string{"alloc-1": {`{"clients":[],"paginationInfo":{"index":0,"totalPages":1}}`}},
+	}
+	client := newTestClient(t, fake, Config{ServiceInstanceID: "si-default"})
+
+	if _, err := client.FetchSnapshot(context.Background()); err != nil {
+		t.Fatalf("fetch snapshot: %v", err)
+	}
+	var leaseRequests int
+	for _, r := range fake.requests {
+		if r.URL.Path != "/v1/org/lic-test/virtual-groups/42/leases" {
+			continue
+		}
+		leaseRequests++
+		if got := r.Header.Get("x-nv-service-instance-id"); got != "si-bound" {
+			t.Fatalf("lease request service instance = %q, want si-bound", got)
+		}
+	}
+	if leaseRequests != 1 {
+		t.Fatalf("lease requests = %d, want 1", leaseRequests)
+	}
+}
+
+func TestFetchSnapshotPaginatesVirtualGroups(t *testing.T) {
+	fake := &fakeCLS{
+		virtualGroupPages: []string{
+			`{"virtualGroups":[{"id":42,"name":"DEFAULT_VG","entitlements":[{"emsEntitlementId":"ent-1","entitlementProductKeys":[{"emsProductKeyId":"pk-1","entitlementFeatures":[{"featureName":"Feature A","totalQuantity":10}]}]}]}],"paginationInfo":{"index":0,"totalPages":2}}`,
+			`{"virtualGroups":[{"id":42,"name":"DEFAULT_VG"},{"id":43,"name":"SECOND_VG","entitlements":[{"emsEntitlementId":"ent-2","entitlementProductKeys":[{"emsProductKeyId":"pk-2","entitlementFeatures":[{"featureName":"Feature B","totalQuantity":20}]}]}]}],"paginationInfo":{"index":1,"totalPages":2}}`,
+		},
+		allocationPages: []string{`{"allocations":[],"paginationInfo":{"index":0,"totalPages":1}}`},
+	}
+	client := newTestClient(t, fake, Config{})
+
+	snap, err := client.FetchSnapshot(context.Background())
+	if err != nil {
+		t.Fatalf("fetch snapshot: %v", err)
+	}
+	got := make(map[int]float64, len(snap.EntitlementFeatures))
+	for _, feature := range snap.EntitlementFeatures {
+		got[feature.VirtualGroupID] += feature.TotalQuantity
+	}
+	if len(snap.EntitlementFeatures) != 2 || got[42] != 10 || got[43] != 20 {
+		t.Fatalf("entitlement features = %+v, want one per virtual group", snap.EntitlementFeatures)
+	}
+}
+
+func TestFetchSnapshotLabelsMappedLeasesWithAllocationFeatureName(t *testing.T) {
+	fake := &fakeCLS{
+		allocationPages: []string{`{"allocations":[{"id":"alloc-1","type":"NVIDIA","deployedOn":"CLOUD","serviceInstanceId":"si-1","allocationFeatures":[{"id":"af-1","featureName":"NVIDIA RTX Virtual Workstation","productName":"Product","licenseType":"CONCURRENT_COUNTED_SINGLE","totalQuantity":10}]}],"paginationInfo":{"index":0,"totalPages":1}}`},
+		leases:          map[string][]string{"alloc-1": {`{"clients":[{"leases":[{"leaseId":"lease-1","featureName":"Quadro-Virtual-DWS","licenseAllotmentFeatureId":"af-1"},{"leaseId":"lease-2","featureName":"Unmapped Feature","licenseAllotmentFeatureId":"af-missing"}]}],"paginationInfo":{"index":0,"totalPages":1}}`}},
+	}
+	client := newTestClient(t, fake, Config{})
+
+	snap, err := client.FetchSnapshot(context.Background())
+	if err != nil {
+		t.Fatalf("fetch snapshot: %v", err)
+	}
+	names := make(map[string]float64, len(snap.ServerFeatureActiveLeases))
+	for _, item := range snap.ServerFeatureActiveLeases {
+		names[item.FeatureName] = item.ActiveLeases
+	}
+	if len(names) != 2 || names["NVIDIA RTX Virtual Workstation"] != 1 || names["Unmapped Feature"] != 1 {
+		t.Fatalf("active lease feature names = %v, want the allocation feature name for mapped leases", names)
 	}
 }
 
@@ -269,6 +355,21 @@ func TestFetchSnapshotUnauthorizedErrorDoesNotExposeAPIKey(t *testing.T) {
 	}
 }
 
+func TestFetchSnapshotErrorRedactsAPIKey(t *testing.T) {
+	client := newTestClient(t, &fakeCLS{forbidden: true}, Config{})
+
+	_, err := client.FetchSnapshot(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "failed with status 403") {
+		t.Fatalf("expected forbidden error, got %v", err)
+	}
+	if strings.Contains(err.Error(), "test-key") {
+		t.Fatal("forbidden error exposes the API key")
+	}
+	if !strings.Contains(err.Error(), "api-key [redacted] is not authorized") {
+		t.Fatalf("expected redacted response body, got %v", err)
+	}
+}
+
 func TestFetchSnapshotRejectsRunawayListing(t *testing.T) {
 	fake := &fakeCLS{allocationPages: []string{fmt.Sprintf(`{"allocations":[],"paginationInfo":{"index":0,"totalPages":%d}}`, maxPages+1)}}
 	client := newTestClient(t, fake, Config{})
@@ -283,14 +384,21 @@ func TestFetchSnapshotRejectsRunawayListing(t *testing.T) {
 }
 
 func TestErrorBody(t *testing.T) {
-	if got := errorBody(strings.NewReader("")); got != "empty response body" {
+	if got := errorBody(strings.NewReader(""), "secret"); got != "empty response body" {
 		t.Fatalf("empty body = %q", got)
 	}
-	if got := errorBody(strings.NewReader("{\n  \"message\":\t\"This API is no longer supported.\"\n}\n")); got != `{ "message": "This API is no longer supported." }` {
+	if got := errorBody(strings.NewReader("{\n  \"message\":\t\"This API is no longer supported.\"\n}\n"), "secret"); got != `{ "message": "This API is no longer supported." }` {
 		t.Fatalf("collapsed body = %q", got)
 	}
-	if got := errorBody(strings.NewReader(strings.Repeat("x", 2*maxErrorBodyBytes))); len(got) != maxErrorBodyBytes {
+	if got := errorBody(strings.NewReader(strings.Repeat("x", 2*maxErrorBodyBytes)), "secret"); len(got) != maxErrorBodyBytes {
 		t.Fatalf("bounded body length = %d, want %d", len(got), maxErrorBodyBytes)
+	}
+	const key = "0123456789abcdef"
+	for offset := maxErrorBodyBytes - len(key); offset <= maxErrorBodyBytes; offset++ {
+		got := errorBody(strings.NewReader(strings.Repeat("x", offset)+key+strings.Repeat("y", maxErrorBodyBytes)), key)
+		if strings.Contains(got, key[:4]) {
+			t.Fatalf("excerpt with key at offset %d exposes part of it: %q", offset, got)
+		}
 	}
 }
 
