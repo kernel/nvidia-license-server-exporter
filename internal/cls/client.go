@@ -368,7 +368,8 @@ func errorBody(body io.Reader, apiKey string) string {
 	raw, _ := io.ReadAll(io.LimitReader(body, int64(maxErrorBodyBytes+len(apiKey))))
 	text := string(raw)
 	if apiKey != "" {
-		text = strings.ReplaceAll(text, apiKey, "[redacted]")
+		// Keep byte offsets stable so a partial key at the read limit cannot move into the excerpt.
+		text = strings.ReplaceAll(text, apiKey, strings.Repeat("*", len(apiKey)))
 	}
 	if len(text) > maxErrorBodyBytes {
 		text = text[:maxErrorBodyBytes]

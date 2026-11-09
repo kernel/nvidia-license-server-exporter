@@ -365,7 +365,7 @@ func TestFetchSnapshotErrorRedactsAPIKey(t *testing.T) {
 	if strings.Contains(err.Error(), "test-key") {
 		t.Fatal("forbidden error exposes the API key")
 	}
-	if !strings.Contains(err.Error(), "api-key [redacted] is not authorized") {
+	if !strings.Contains(err.Error(), "api-key ******** is not authorized") {
 		t.Fatalf("expected redacted response body, got %v", err)
 	}
 }
@@ -398,6 +398,25 @@ func TestErrorBody(t *testing.T) {
 		got := errorBody(strings.NewReader(strings.Repeat("x", offset)+key+strings.Repeat("y", maxErrorBodyBytes)), key)
 		if strings.Contains(got, key[:4]) {
 			t.Fatalf("excerpt with key at offset %d exposes part of it: %q", offset, got)
+		}
+	}
+}
+
+func TestErrorBodyRedactsRepeatedKeysAtReadBoundary(t *testing.T) {
+	const key = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+	for _, echoes := range []int{1, 4} {
+		prefix := strings.Repeat(key+" ", echoes)
+		for offset := maxErrorBodyBytes + 1; offset < maxErrorBodyBytes+len(key); offset++ {
+			t.Run(fmt.Sprintf("echoes=%d/offset=%d", echoes, offset), func(t *testing.T) {
+				body := prefix + strings.Repeat("x", offset-len(prefix)) + key
+				got := errorBody(strings.NewReader(body), key)
+				if strings.Contains(got, key[:1]) {
+					t.Fatalf("excerpt exposes part of the trailing key: %q", got)
+				}
+				if len(got) > maxErrorBodyBytes {
+					t.Fatalf("excerpt length = %d, want at most %d", len(got), maxErrorBodyBytes)
+				}
+			})
 		}
 	}
 }
