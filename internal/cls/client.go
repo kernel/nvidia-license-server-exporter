@@ -1,14 +1,17 @@
 package cls
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log"
+	"maps"
 	"net/http"
 	"net/url"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -167,26 +170,36 @@ func (c *Client) FetchSnapshot(ctx context.Context) (*Snapshot, error) {
 		return nil, err
 	}
 
-	var snapshotMu sync.Mutex
+	bound := make(map[leaseListing][]allocation)
+	for _, a := range allocations {
+		snapshot.ServerInfo = append(snapshot.ServerInfo, a.info())
+		snapshot.ServerFeatureCapacity = append(snapshot.ServerFeatureCapacity, a.featureCapacity()...)
+		if serviceInstanceID := c.leaseServiceInstance(a); serviceInstanceID != "" {
+			listing := leaseListing{virtualGroupID: a.VirtualGroupID, serviceInstanceID: serviceInstanceID}
+			bound[listing] = append(bound[listing], a)
+		}
+	}
+
+	leases := make(map[leaseListing][]lease, len(bound))
+	var leasesMu sync.Mutex
 	leaseGroup, leaseCtx := errgroup.WithContext(ctx)
 	leaseGroup.SetLimit(c.parallelFetches)
-	for _, a := range allocations {
+	for listing := range bound {
 		leaseGroup.Go(func() error {
-			leases, err := c.listAllocationLeases(leaseCtx, a)
+			listed, err := c.listLeases(leaseCtx, listing)
 			if err != nil {
-				return fmt.Errorf("list active leases for allocation %s in virtual-group %d: %w", a.ID, a.VirtualGroupID, err)
+				return fmt.Errorf("list active leases for service-instance %s in virtual-group %d: %w", listing.serviceInstanceID, listing.virtualGroupID, err)
 			}
-			snapshotMu.Lock()
-			snapshot.ServerInfo = append(snapshot.ServerInfo, a.info())
-			snapshot.ServerFeatureCapacity = append(snapshot.ServerFeatureCapacity, a.featureCapacity()...)
-			snapshot.ServerFeatureActiveLeases = append(snapshot.ServerFeatureActiveLeases, a.featureActiveLeases(leases)...)
-			snapshotMu.Unlock()
+			leasesMu.Lock()
+			leases[listing] = listed
+			leasesMu.Unlock()
 			return nil
 		})
 	}
 	if err := leaseGroup.Wait(); err != nil {
 		return nil, err
 	}
+	snapshot.ServerFeatureActiveLeases = activeLeases(allocations, bound, leases)
 
 	return snapshot, nil
 }
@@ -273,39 +286,47 @@ func (c *Client) listAllocations(ctx context.Context, vg virtualGroup) ([]alloca
 	return allocations, nil
 }
 
-// listAllocationLeases walks the paginated active leases of one CLS allocation.
-// A lease ID can repeat across pages, so each is returned once.
-// A configured service instance fills in missing binding metadata; it does not
-// override an allocation's type or deployment. NVIDIA omits the binding when a
-// license file has been generated for the allocation, so the fallback does not
-// apply to those.
-func (c *Client) listAllocationLeases(ctx context.Context, a allocation) ([]lease, error) {
+// leaseListing identifies one active-lease listing. NVIDIA lists leases per
+// service instance within a virtual group, so one listing covers every
+// allocation bound to that service instance.
+type leaseListing struct {
+	virtualGroupID    int
+	serviceInstanceID string
+}
+
+// leaseServiceInstance returns the service instance that lists the leases of a
+// CLS allocation, or "" when the allocation has none to list. A configured
+// service instance fills in missing binding metadata; it does not override an
+// allocation's type or deployment. NVIDIA omits the binding when a license
+// file has been generated for the allocation, so the fallback does not apply
+// to those.
+func (c *Client) leaseServiceInstance(a allocation) string {
 	if a.Type != "" && a.Type != "NVIDIA" {
-		return nil, nil
+		return ""
 	}
 	if a.DeployedOn != "" && a.DeployedOn != "CLOUD" {
-		return nil, nil
+		return ""
 	}
 	serviceInstanceID := strings.TrimSpace(a.ServiceInstanceID)
-	if serviceInstanceID == "" && a.ArtifactType == "" {
-		serviceInstanceID = c.serviceInstanceID
+	if serviceInstanceID != "" || a.ArtifactType != "" {
+		return serviceInstanceID
 	}
-	if serviceInstanceID == "" {
-		if a.ArtifactType == "" {
-			log.Printf("skipping active leases for allocation %s in virtual-group %d: no service instance is bound and NVIDIA_SERVICE_INSTANCE_ID is not set", a.ID, a.VirtualGroupID)
-		}
-		return nil, nil
+	if c.serviceInstanceID == "" {
+		log.Printf("skipping active leases for allocation %s in virtual-group %d: no service instance is bound and NVIDIA_SERVICE_INSTANCE_ID is not set", a.ID, a.VirtualGroupID)
 	}
-	base := fmt.Sprintf("%s/v1/org/%s/virtual-groups/%d/leases", c.baseURL, url.PathEscape(c.orgName), a.VirtualGroupID)
+	return c.serviceInstanceID
+}
+
+// listLeases walks the paginated active leases of a service instance in a
+// virtual group. A lease ID can repeat across pages, so each is returned once.
+func (c *Client) listLeases(ctx context.Context, listing leaseListing) ([]lease, error) {
+	base := fmt.Sprintf("%s/v1/org/%s/virtual-groups/%d/leases", c.baseURL, url.PathEscape(c.orgName), listing.virtualGroupID)
 	seen := make(map[string]struct{})
 	leases := make([]lease, 0)
 	err := listPages(ctx, c, func(page int) string {
-		query := url.Values{
-			"license_server_ids": {a.ID},
-			"page_number":        {strconv.Itoa(page)},
-		}
+		query := url.Values{"page_number": {strconv.Itoa(page)}}
 		return base + "?" + query.Encode()
-	}, serviceInstanceID, func(resp leasesResponse) (items, fresh int) {
+	}, listing.serviceInstanceID, func(resp leasesResponse) (items, fresh int) {
 		for _, client := range resp.Clients {
 			for _, l := range client.Leases {
 				items++
@@ -510,56 +531,69 @@ func (a allocation) featureCapacity() []ServerFeatureCapacitySnapshot {
 	return capacity
 }
 
-type activeFeatureKey struct {
-	featureName string
-	productName string
-	licenseType string
-}
-
-// featureActiveLeases counts leases per allocation feature. A lease that
-// matches none of the allocation's features is counted under unknown labels and
-// logged: it means the lease filter or the feature IDs are not what this client
-// expects.
-func (a allocation) featureActiveLeases(leases []lease) []ServerFeatureActiveLeaseSnapshot {
-	featureByID := make(map[string]allocationFeature, len(a.AllocationFeatures))
-	for _, feature := range a.AllocationFeatures {
-		featureByID[feature.ID] = feature
+// activeLeases counts every lease once, under the allocation that owns the
+// feature the lease was granted from, so a count never depends on how NVIDIA
+// scopes a listing. A lease whose feature no allocation lists is logged and
+// counted with an unknown product and license type, under the only allocation
+// of its listing or, when the listing covers several, under no server.
+func activeLeases(allocations []allocation, bound map[leaseListing][]allocation, leases map[leaseListing][]lease) []ServerFeatureActiveLeaseSnapshot {
+	type featureOwner struct {
+		allocation allocation
+		feature    allocationFeature
+	}
+	owners := make(map[string]featureOwner)
+	for _, a := range allocations {
+		for _, feature := range a.AllocationFeatures {
+			if feature.ID != "" {
+				owners[feature.ID] = featureOwner{allocation: a, feature: feature}
+			}
+		}
 	}
 
-	counts := make(map[activeFeatureKey]float64)
-	order := make([]activeFeatureKey, 0)
-	unmatched := 0
-	for _, l := range leases {
-		feature, ok := featureByID[l.LicenseAllotmentFeatureID]
-		if !ok {
-			unmatched++
+	listings := slices.SortedFunc(maps.Keys(bound), func(a, b leaseListing) int {
+		return cmp.Or(cmp.Compare(a.virtualGroupID, b.virtualGroupID), cmp.Compare(a.serviceInstanceID, b.serviceInstanceID))
+	})
+	seen := make(map[string]struct{})
+	positions := make(map[ServerFeatureActiveLeaseSnapshot]int)
+	snapshots := make([]ServerFeatureActiveLeaseSnapshot, 0)
+	for _, listing := range listings {
+		covered := bound[listing]
+		unmatched := 0
+		for _, l := range leases[listing] {
+			if leaseID := strings.TrimSpace(l.LeaseID); leaseID != "" {
+				if _, ok := seen[leaseID]; ok {
+					continue
+				}
+				seen[leaseID] = struct{}{}
+			}
+			owner, ok := owners[l.LicenseAllotmentFeatureID]
+			if !ok {
+				unmatched++
+				owner.allocation = allocation{VirtualGroupID: covered[0].VirtualGroupID, VirtualGroupName: covered[0].VirtualGroupName}
+				if len(covered) == 1 {
+					owner.allocation = covered[0]
+				}
+			}
+			key := ServerFeatureActiveLeaseSnapshot{
+				VirtualGroupID:   owner.allocation.VirtualGroupID,
+				VirtualGroupName: owner.allocation.VirtualGroupName,
+				ServerID:         owner.allocation.ID,
+				ServerName:       owner.allocation.Name,
+				FeatureName:      firstNonEmptyNonBlank(owner.feature.FeatureName, l.FeatureName, "unknown"),
+				ProductName:      firstNonEmptyNonBlank(owner.feature.ProductName, "unknown"),
+				LicenseType:      firstNonEmptyNonBlank(owner.feature.LicenseType, "unknown"),
+			}
+			position, ok := positions[key]
+			if !ok {
+				position = len(snapshots)
+				positions[key] = position
+				snapshots = append(snapshots, key)
+			}
+			snapshots[position].ActiveLeases++
 		}
-		key := activeFeatureKey{
-			featureName: firstNonEmptyNonBlank(feature.FeatureName, l.FeatureName, "unknown"),
-			productName: firstNonEmptyNonBlank(feature.ProductName, "unknown"),
-			licenseType: firstNonEmptyNonBlank(feature.LicenseType, "unknown"),
+		if unmatched > 0 {
+			log.Printf("%d of %d active leases for service-instance %s in virtual-group %d match no allocation feature", unmatched, len(leases[listing]), listing.serviceInstanceID, listing.virtualGroupID)
 		}
-		if _, ok := counts[key]; !ok {
-			order = append(order, key)
-		}
-		counts[key]++
-	}
-	if unmatched > 0 {
-		log.Printf("%d of %d active leases for allocation %s in virtual-group %d match none of its features", unmatched, len(leases), a.ID, a.VirtualGroupID)
-	}
-
-	snapshots := make([]ServerFeatureActiveLeaseSnapshot, 0, len(order))
-	for _, key := range order {
-		snapshots = append(snapshots, ServerFeatureActiveLeaseSnapshot{
-			VirtualGroupID:   a.VirtualGroupID,
-			VirtualGroupName: a.VirtualGroupName,
-			ServerID:         a.ID,
-			ServerName:       a.Name,
-			FeatureName:      key.featureName,
-			ProductName:      key.productName,
-			LicenseType:      key.licenseType,
-			ActiveLeases:     counts[key],
-		})
 	}
 	return snapshots
 }

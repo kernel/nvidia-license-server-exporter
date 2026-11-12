@@ -27,8 +27,8 @@ const (
 type fakeCLS struct {
 	mu       sync.Mutex
 	requests []*http.Request
-	// leases serves the active leases of one allocation per page, keyed by
-	// allocation ID; allocations without an entry answer 404.
+	// leases serves the active leases of one service instance per page, keyed
+	// by service instance ID; service instances without an entry answer 404.
 	leases map[string][]string
 	// allocationPages overrides the default two allocation pages.
 	allocationPages []string
@@ -68,8 +68,8 @@ func (f *fakeCLS) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		_, _ = w.Write([]byte(pages[pageIndex(r.URL.Query().Get("page-number"), len(pages))]))
 	case "/v1/org/lic-test/virtual-groups/42/leases":
-		pages, ok := f.leases[r.URL.Query().Get("license_server_ids")]
-		if !ok || r.Header.Get("x-nv-service-instance-id") == "" {
+		pages, ok := f.leases[r.Header.Get("x-nv-service-instance-id")]
+		if !ok {
 			http.Error(w, `{"message":"Service instance or license server was not found in the system."}`, http.StatusNotFound)
 			return
 		}
@@ -118,7 +118,7 @@ func newTestClient(t *testing.T, fake *fakeCLS, cfg Config) *Client {
 }
 
 func TestFetchSnapshotUsesSupportedEndpoints(t *testing.T) {
-	fake := &fakeCLS{leases: map[string][]string{"alloc-1": {leasesPage0, leasesPage1}}}
+	fake := &fakeCLS{leases: map[string][]string{"si-1": {leasesPage0, leasesPage1}}}
 	client := newTestClient(t, fake, Config{ServiceInstanceID: "si-default"})
 
 	snap, err := client.FetchSnapshot(context.Background())
@@ -137,8 +137,8 @@ func TestFetchSnapshotUsesSupportedEndpoints(t *testing.T) {
 		"/v1/org/lic-test/virtual-groups?page-number=0",
 		"/v1/org/lic-test/virtual-groups/42/allocations?page-number=0",
 		"/v1/org/lic-test/virtual-groups/42/allocations?page-number=1",
-		"/v1/org/lic-test/virtual-groups/42/leases?license_server_ids=alloc-1&page_number=0",
-		"/v1/org/lic-test/virtual-groups/42/leases?license_server_ids=alloc-1&page_number=1",
+		"/v1/org/lic-test/virtual-groups/42/leases?page_number=0",
+		"/v1/org/lic-test/virtual-groups/42/leases?page_number=1",
 	}
 	if got := fake.paths(); strings.Join(got, "\n") != strings.Join(wantPaths, "\n") {
 		t.Fatalf("requests = %v, want %v", got, wantPaths)
@@ -198,7 +198,7 @@ func TestFetchSnapshotUsesSupportedEndpoints(t *testing.T) {
 func TestFetchSnapshotUsesConfiguredServiceInstanceFallback(t *testing.T) {
 	fake := &fakeCLS{
 		allocationPages: []string{`{"allocations":[{"id":"alloc-1","type":"NVIDIA","deployedOn":"CLOUD","allocationFeatures":[]}],"paginationInfo":{"index":0,"totalPages":1}}`},
-		leases:          map[string][]string{"alloc-1": {`{"clients":[],"paginationInfo":{"index":0,"size":0,"totalResults":0,"totalPages":0}}`}},
+		leases:          map[string][]string{"si-default": {`{"clients":[],"paginationInfo":{"index":0,"size":0,"totalResults":0,"totalPages":0}}`}},
 	}
 	client := newTestClient(t, fake, Config{ServiceInstanceID: "si-default"})
 
@@ -261,7 +261,7 @@ func TestFetchSnapshotSkipsNonCLSLeases(t *testing.T) {
 func TestFetchSnapshotUsesBoundServiceInstanceOfArtifactAllocation(t *testing.T) {
 	fake := &fakeCLS{
 		allocationPages: []string{`{"allocations":[{"id":"alloc-1","type":"NVIDIA","artifactType":"LEGACY_CLOUD_NLL_FILE","serviceInstanceId":"si-bound","allocationFeatures":[]}],"paginationInfo":{"index":0,"totalPages":1}}`},
-		leases:          map[string][]string{"alloc-1": {`{"clients":[],"paginationInfo":{"index":0,"totalPages":1}}`}},
+		leases:          map[string][]string{"si-bound": {`{"clients":[],"paginationInfo":{"index":0,"totalPages":1}}`}},
 	}
 	client := newTestClient(t, fake, Config{ServiceInstanceID: "si-default"})
 
@@ -309,7 +309,7 @@ func TestFetchSnapshotPaginatesVirtualGroups(t *testing.T) {
 func TestFetchSnapshotLabelsMappedLeasesWithAllocationFeatureName(t *testing.T) {
 	fake := &fakeCLS{
 		allocationPages: []string{`{"allocations":[{"id":"alloc-1","type":"NVIDIA","deployedOn":"CLOUD","serviceInstanceId":"si-1","allocationFeatures":[{"id":"af-1","featureName":"NVIDIA RTX Virtual Workstation","productName":"Product","licenseType":"CONCURRENT_COUNTED_SINGLE","totalQuantity":10}]}],"paginationInfo":{"index":0,"totalPages":1}}`},
-		leases:          map[string][]string{"alloc-1": {`{"clients":[{"leases":[{"leaseId":"lease-1","featureName":"Quadro-Virtual-DWS","licenseAllotmentFeatureId":"af-1"},{"leaseId":"lease-2","featureName":"Unmapped Feature","licenseAllotmentFeatureId":"af-missing"}]}],"paginationInfo":{"index":0,"totalPages":1}}`}},
+		leases:          map[string][]string{"si-1": {`{"clients":[{"leases":[{"leaseId":"lease-1","featureName":"Quadro-Virtual-DWS","licenseAllotmentFeatureId":"af-1"},{"leaseId":"lease-2","featureName":"Unmapped Feature","licenseAllotmentFeatureId":"af-missing"}]}],"paginationInfo":{"index":0,"totalPages":1}}`}},
 	}
 	client := newTestClient(t, fake, Config{})
 
@@ -334,7 +334,7 @@ func TestFetchSnapshotErrorIncludesResponseBody(t *testing.T) {
 	if snap != nil || err == nil {
 		t.Fatalf("expected failed snapshot, got snapshot=%v err=%v", snap, err)
 	}
-	for _, want := range []string{"allocation alloc-1", "failed with status 404", "not found in the system"} {
+	for _, want := range []string{"service-instance si-1", "failed with status 404", "not found in the system"} {
 		if !strings.Contains(err.Error(), want) {
 			t.Fatalf("error %q does not mention %q", err, want)
 		}
@@ -389,7 +389,7 @@ func TestFetchSnapshotRejectsRepeatedLeasePage(t *testing.T) {
 	// A listing that ignores page_number answers every page with the first one.
 	fake := &fakeCLS{
 		allocationPages: []string{`{"allocations":[{"id":"alloc-1","type":"NVIDIA","deployedOn":"CLOUD","serviceInstanceId":"si-1","allocationFeatures":[]}],"paginationInfo":{"index":0,"totalPages":1}}`},
-		leases:          map[string][]string{"alloc-1": {`{"clients":[{"leases":[{"leaseId":"lease-1"},{"leaseId":"lease-2"}]}],"paginationInfo":{"index":0,"size":2,"totalResults":4,"totalPages":2}}`}},
+		leases:          map[string][]string{"si-1": {`{"clients":[{"leases":[{"leaseId":"lease-1"},{"leaseId":"lease-2"}]}],"paginationInfo":{"index":0,"size":2,"totalResults":4,"totalPages":2}}`}},
 	}
 	client := newTestClient(t, fake, Config{})
 
@@ -397,7 +397,7 @@ func TestFetchSnapshotRejectsRepeatedLeasePage(t *testing.T) {
 	if snap != nil || err == nil {
 		t.Fatalf("expected failed snapshot, got snapshot=%v err=%v", snap, err)
 	}
-	for _, want := range []string{"allocation alloc-1", "page 1 of the listing only repeated earlier results"} {
+	for _, want := range []string{"service-instance si-1", "page 1 of the listing only repeated earlier results"} {
 		if !strings.Contains(err.Error(), want) {
 			t.Fatalf("error %q does not mention %q", err, want)
 		}
@@ -413,15 +413,12 @@ func captureLogs(t *testing.T) *bytes.Buffer {
 	return &logs
 }
 
-func TestFetchSnapshotLogsLeasesOutsideAllocationFeatures(t *testing.T) {
+func TestFetchSnapshotCountsLeasesOfSharedServiceInstanceOnce(t *testing.T) {
 	logs := captureLogs(t)
 
-	// A listing that ignores license_server_ids answers every allocation with
-	// all leases of the service instance.
-	allLeases := `{"clients":[{"leases":[{"leaseId":"lease-1","featureName":"Feature","licenseAllotmentFeatureId":"af-1"},{"leaseId":"lease-2","featureName":"Feature","licenseAllotmentFeatureId":"af-2"}]}],"paginationInfo":{"index":0,"totalPages":1}}`
 	fake := &fakeCLS{
-		allocationPages: []string{`{"allocations":[{"id":"alloc-1","type":"NVIDIA","deployedOn":"CLOUD","serviceInstanceId":"si-1","allocationFeatures":[{"id":"af-1","featureName":"Feature","productName":"Product A","licenseType":"CONCURRENT_COUNTED_SINGLE","totalQuantity":10}]},{"id":"alloc-2","type":"NVIDIA","deployedOn":"CLOUD","serviceInstanceId":"si-1","allocationFeatures":[{"id":"af-2","featureName":"Feature","productName":"Product B","licenseType":"CONCURRENT_COUNTED_SINGLE","totalQuantity":10}]}],"paginationInfo":{"index":0,"totalPages":1}}`},
-		leases:          map[string][]string{"alloc-1": {allLeases}, "alloc-2": {allLeases}},
+		allocationPages: []string{`{"allocations":[{"id":"alloc-1","type":"NVIDIA","name":"server-1","deployedOn":"CLOUD","serviceInstanceId":"si-1","allocationFeatures":[{"id":"af-1","featureName":"Feature","productName":"Product A","licenseType":"CONCURRENT_COUNTED_SINGLE","totalQuantity":10}]},{"id":"alloc-2","type":"NVIDIA","name":"server-2","deployedOn":"CLOUD","serviceInstanceId":"si-1","allocationFeatures":[{"id":"af-2","featureName":"Feature","productName":"Product B","licenseType":"CONCURRENT_COUNTED_SINGLE","totalQuantity":10}]}],"paginationInfo":{"index":0,"totalPages":1}}`},
+		leases:          map[string][]string{"si-1": {`{"clients":[{"leases":[{"leaseId":"lease-1","featureName":"Feature","licenseAllotmentFeatureId":"af-1"},{"leaseId":"lease-2","featureName":"Feature","licenseAllotmentFeatureId":"af-2"},{"leaseId":"lease-3","featureName":"Feature","licenseAllotmentFeatureId":"af-missing"}]}],"paginationInfo":{"index":0,"totalPages":1}}`}},
 	}
 	client := newTestClient(t, fake, Config{})
 
@@ -429,11 +426,23 @@ func TestFetchSnapshotLogsLeasesOutsideAllocationFeatures(t *testing.T) {
 	if err != nil {
 		t.Fatalf("fetch snapshot: %v", err)
 	}
+	var leaseRequests int
+	for _, path := range fake.paths() {
+		if strings.Contains(path, "/leases") {
+			leaseRequests++
+		}
+	}
+	if leaseRequests != 1 {
+		t.Fatalf("lease requests = %d, want one for the shared service instance", leaseRequests)
+	}
 	got := make(map[string]float64, len(snap.ServerFeatureActiveLeases))
 	for _, item := range snap.ServerFeatureActiveLeases {
-		got[item.ServerID+"/"+item.ProductName] = item.ActiveLeases
+		if item.VirtualGroupID != 42 || item.VirtualGroupName != "DEFAULT_VG" {
+			t.Fatalf("unexpected virtual group: %+v", item)
+		}
+		got[item.ServerName+"/"+item.ProductName] = item.ActiveLeases
 	}
-	want := map[string]float64{"alloc-1/Product A": 1, "alloc-1/unknown": 1, "alloc-2/Product B": 1, "alloc-2/unknown": 1}
+	want := map[string]float64{"server-1/Product A": 1, "server-2/Product B": 1, "/unknown": 1}
 	if len(got) != len(want) {
 		t.Fatalf("active leases = %v, want %v", got, want)
 	}
@@ -442,13 +451,42 @@ func TestFetchSnapshotLogsLeasesOutsideAllocationFeatures(t *testing.T) {
 			t.Fatalf("active leases = %v, want %v", got, want)
 		}
 	}
-	for _, notice := range []string{
-		"1 of 2 active leases for allocation alloc-1 in virtual-group 42 match none of its features",
-		"1 of 2 active leases for allocation alloc-2 in virtual-group 42 match none of its features",
-	} {
-		if !strings.Contains(logs.String(), notice) {
-			t.Fatalf("logs = %q, want %q", logs.String(), notice)
-		}
+	if notice := "1 of 3 active leases for service-instance si-1 in virtual-group 42 match no allocation feature"; !strings.Contains(logs.String(), notice) {
+		t.Fatalf("logs = %q, want %q", logs.String(), notice)
+	}
+}
+
+func TestActiveLeasesCountsLeaseListedInTwoVirtualGroupsOnce(t *testing.T) {
+	// A listing that ignores its virtual group answers with every lease of the
+	// service instance.
+	owner := allocation{ID: "alloc-1", Name: "server-1", VirtualGroupID: 42, VirtualGroupName: "DEFAULT_VG", AllocationFeatures: []allocationFeature{{ID: "af-1", FeatureName: "Feature", ProductName: "Product", LicenseType: "CONCURRENT_COUNTED_SINGLE"}}}
+	other := allocation{ID: "alloc-2", Name: "server-2", VirtualGroupID: 43, VirtualGroupName: "SECOND_VG"}
+	listed := []lease{{LeaseID: "lease-1", LicenseAllotmentFeatureID: "af-1"}}
+	first := leaseListing{virtualGroupID: 42, serviceInstanceID: "si-1"}
+	second := leaseListing{virtualGroupID: 43, serviceInstanceID: "si-1"}
+
+	got := activeLeases(
+		[]allocation{owner, other},
+		map[leaseListing][]allocation{first: {owner}, second: {other}},
+		map[leaseListing][]lease{first: listed, second: listed},
+	)
+	want := ServerFeatureActiveLeaseSnapshot{VirtualGroupID: 42, VirtualGroupName: "DEFAULT_VG", ServerID: "alloc-1", ServerName: "server-1", FeatureName: "Feature", ProductName: "Product", LicenseType: "CONCURRENT_COUNTED_SINGLE", ActiveLeases: 1}
+	if len(got) != 1 || got[0] != want {
+		t.Fatalf("active leases = %+v, want %+v", got, want)
+	}
+}
+
+func TestActiveLeasesDoesNotMatchFeaturesWithoutID(t *testing.T) {
+	a := allocation{ID: "alloc-1", VirtualGroupID: 42, AllocationFeatures: []allocationFeature{{FeatureName: "Feature", ProductName: "Product"}}}
+	listing := leaseListing{virtualGroupID: 42, serviceInstanceID: "si-1"}
+
+	got := activeLeases(
+		[]allocation{a},
+		map[leaseListing][]allocation{listing: {a}},
+		map[leaseListing][]lease{listing: {{LeaseID: "lease-1", FeatureName: "Leased Feature"}}},
+	)
+	if len(got) != 1 || got[0].ServerID != "alloc-1" || got[0].FeatureName != "Leased Feature" || got[0].ProductName != "unknown" {
+		t.Fatalf("active leases = %+v, want one unmatched lease on alloc-1", got)
 	}
 }
 

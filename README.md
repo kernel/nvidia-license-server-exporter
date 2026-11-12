@@ -20,13 +20,13 @@ The exporter reads the supported listing endpoints of the NVIDIA Licensing Porta
 
 - `GET /v1/org/{org}/virtual-groups` (paginated) for entitlement features
 - `GET /v1/org/{org}/virtual-groups/{vg}/allocations` (paginated) for license servers and their features
-- `GET /v1/org/{org}/virtual-groups/{vg}/leases` (paginated, filtered by `license_server_ids`, scoped by `X-NV-SERVICE-INSTANCE-ID`) for active leases
+- `GET /v1/org/{org}/virtual-groups/{vg}/leases` (paginated, scoped by `X-NV-SERVICE-INSTANCE-ID`) for active leases, once per service instance in a virtual group
 
 Lease lookups skip allocations that are not NVIDIA License System allocations (network-license and legacy Flexera allocations) and explicitly non-cloud deployments, even when `NVIDIA_SERVICE_INSTANCE_ID` is configured. `NVIDIA_SERVICE_INSTANCE_ID` only fills in a missing binding for allocations without a generated license file. Their metadata and capacity are still exported.
 
 A cloud allocation that reports no service instance, with `NVIDIA_SERVICE_INSTANCE_ID` unset, is logged and exported without active leases.
 
-A lease that matches none of its allocation's features is exported with `product_name` and `license_type` set to `unknown`, and the count is logged per allocation. Such leases mean the lease filter or the feature IDs differ from what the exporter expects.
+Each lease is counted once, under the allocation that owns the feature it was granted from. A lease whose feature no allocation lists is exported with `product_name` and `license_type` set to `unknown`, and the count is logged per listing. It is counted under the listing's allocation when there is only one, and under `server_id="unknown"` when the listing covers several.
 
 A page that only repeats earlier results fails the collection. NVIDIA's lease listing has returned at most 100 clients per response, so an ignored page parameter would otherwise cap the lease count without an error.
 
