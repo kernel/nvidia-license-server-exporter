@@ -404,11 +404,56 @@ func TestFetchSnapshotRejectsRepeatedLeasePage(t *testing.T) {
 	}
 }
 
-func TestFetchSnapshotLogsCloudAllocationWithoutServiceInstance(t *testing.T) {
+func captureLogs(t *testing.T) *bytes.Buffer {
+	t.Helper()
 	var logs bytes.Buffer
 	previous := log.Writer()
 	log.SetOutput(&logs)
 	t.Cleanup(func() { log.SetOutput(previous) })
+	return &logs
+}
+
+func TestFetchSnapshotLogsLeasesOutsideAllocationFeatures(t *testing.T) {
+	logs := captureLogs(t)
+
+	// A listing that ignores license_server_ids answers every allocation with
+	// all leases of the service instance.
+	allLeases := `{"clients":[{"leases":[{"leaseId":"lease-1","featureName":"Feature","licenseAllotmentFeatureId":"af-1"},{"leaseId":"lease-2","featureName":"Feature","licenseAllotmentFeatureId":"af-2"}]}],"paginationInfo":{"index":0,"totalPages":1}}`
+	fake := &fakeCLS{
+		allocationPages: []string{`{"allocations":[{"id":"alloc-1","type":"NVIDIA","deployedOn":"CLOUD","serviceInstanceId":"si-1","allocationFeatures":[{"id":"af-1","featureName":"Feature","productName":"Product A","licenseType":"CONCURRENT_COUNTED_SINGLE","totalQuantity":10}]},{"id":"alloc-2","type":"NVIDIA","deployedOn":"CLOUD","serviceInstanceId":"si-1","allocationFeatures":[{"id":"af-2","featureName":"Feature","productName":"Product B","licenseType":"CONCURRENT_COUNTED_SINGLE","totalQuantity":10}]}],"paginationInfo":{"index":0,"totalPages":1}}`},
+		leases:          map[string][]string{"alloc-1": {allLeases}, "alloc-2": {allLeases}},
+	}
+	client := newTestClient(t, fake, Config{})
+
+	snap, err := client.FetchSnapshot(context.Background())
+	if err != nil {
+		t.Fatalf("fetch snapshot: %v", err)
+	}
+	got := make(map[string]float64, len(snap.ServerFeatureActiveLeases))
+	for _, item := range snap.ServerFeatureActiveLeases {
+		got[item.ServerID+"/"+item.ProductName] = item.ActiveLeases
+	}
+	want := map[string]float64{"alloc-1/Product A": 1, "alloc-1/unknown": 1, "alloc-2/Product B": 1, "alloc-2/unknown": 1}
+	if len(got) != len(want) {
+		t.Fatalf("active leases = %v, want %v", got, want)
+	}
+	for key, count := range want {
+		if got[key] != count {
+			t.Fatalf("active leases = %v, want %v", got, want)
+		}
+	}
+	for _, notice := range []string{
+		"1 of 2 active leases for allocation alloc-1 in virtual-group 42 match none of its features",
+		"1 of 2 active leases for allocation alloc-2 in virtual-group 42 match none of its features",
+	} {
+		if !strings.Contains(logs.String(), notice) {
+			t.Fatalf("logs = %q, want %q", logs.String(), notice)
+		}
+	}
+}
+
+func TestFetchSnapshotLogsCloudAllocationWithoutServiceInstance(t *testing.T) {
+	logs := captureLogs(t)
 
 	fake := &fakeCLS{allocationPages: []string{`{"allocations":[{"id":"alloc-unbound","type":"NVIDIA","deployedOn":"CLOUD","allocationFeatures":[{"id":"af-1","featureName":"Feature","productName":"Product","licenseType":"CONCURRENT_COUNTED_SINGLE","totalQuantity":10}]},{"id":"alloc-license-file","type":"NVIDIA","artifactType":"NLL_FILE","allocationFeatures":[]}],"paginationInfo":{"index":0,"totalPages":1}}`}}
 	client := newTestClient(t, fake, Config{})

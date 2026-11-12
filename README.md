@@ -26,6 +26,8 @@ Lease lookups skip allocations that are not NVIDIA License System allocations (n
 
 A cloud allocation that reports no service instance, with `NVIDIA_SERVICE_INSTANCE_ID` unset, is logged and exported without active leases.
 
+A lease that matches none of its allocation's features is exported with `product_name` and `license_type` set to `unknown`, and the count is logged per allocation. Such leases mean the lease filter or the feature IDs differ from what the exporter expects.
+
 A page that only repeats earlier results fails the collection. NVIDIA's lease listing has returned at most 100 clients per response, so an ignored page parameter would otherwise cap the lease count without an error.
 
 NVIDIA retired `.../license-servers/{id}/license-pools` (it now answers HTTP 400 "This API is no longer supported") and deprecated `.../license-servers` in favor of allocations; neither is used.

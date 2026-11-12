@@ -516,7 +516,10 @@ type activeFeatureKey struct {
 	licenseType string
 }
 
-// featureActiveLeases counts leases per allocation feature.
+// featureActiveLeases counts leases per allocation feature. A lease that
+// matches none of the allocation's features is counted under unknown labels and
+// logged: it means the lease filter or the feature IDs are not what this client
+// expects.
 func (a allocation) featureActiveLeases(leases []lease) []ServerFeatureActiveLeaseSnapshot {
 	featureByID := make(map[string]allocationFeature, len(a.AllocationFeatures))
 	for _, feature := range a.AllocationFeatures {
@@ -525,8 +528,12 @@ func (a allocation) featureActiveLeases(leases []lease) []ServerFeatureActiveLea
 
 	counts := make(map[activeFeatureKey]float64)
 	order := make([]activeFeatureKey, 0)
+	unmatched := 0
 	for _, l := range leases {
-		feature := featureByID[l.LicenseAllotmentFeatureID]
+		feature, ok := featureByID[l.LicenseAllotmentFeatureID]
+		if !ok {
+			unmatched++
+		}
 		key := activeFeatureKey{
 			featureName: firstNonEmptyNonBlank(feature.FeatureName, l.FeatureName, "unknown"),
 			productName: firstNonEmptyNonBlank(feature.ProductName, "unknown"),
@@ -536,6 +543,9 @@ func (a allocation) featureActiveLeases(leases []lease) []ServerFeatureActiveLea
 			order = append(order, key)
 		}
 		counts[key]++
+	}
+	if unmatched > 0 {
+		log.Printf("%d of %d active leases for allocation %s in virtual-group %d match none of its features", unmatched, len(leases), a.ID, a.VirtualGroupID)
 	}
 
 	snapshots := make([]ServerFeatureActiveLeaseSnapshot, 0, len(order))
