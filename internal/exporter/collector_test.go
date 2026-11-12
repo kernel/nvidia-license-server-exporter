@@ -2,6 +2,7 @@ package exporter
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -16,6 +17,39 @@ type entitlementFetcher struct {
 
 func (f entitlementFetcher) FetchSnapshot(context.Context) (*cls.Snapshot, error) {
 	return f.snapshot, nil
+}
+
+type failingFetcher struct{}
+
+func (failingFetcher) FetchSnapshot(context.Context) (*cls.Snapshot, error) {
+	return nil, errors.New("request failed with status 400")
+}
+
+func TestCollectorReportsFailedColdStart(t *testing.T) {
+	registry := prometheus.NewPedanticRegistry()
+	registry.MustRegister(NewCollector(snapshot.NewService(failingFetcher{}, time.Minute), "org-1", time.Second))
+
+	families, err := registry.Gather()
+	if err != nil {
+		t.Fatalf("gather metrics: %v", err)
+	}
+
+	got := make(map[string]float64, len(families))
+	for _, family := range families {
+		if len(family.GetMetric()) != 1 {
+			t.Fatalf("family %s has %d metrics, want 1", family.GetName(), len(family.GetMetric()))
+		}
+		got[family.GetName()] = family.GetMetric()[0].GetGauge().GetValue()
+	}
+	if up, ok := got["nvidia_cls_up"]; !ok || up != 0 {
+		t.Fatalf("nvidia_cls_up = %v, want 0: %v", got["nvidia_cls_up"], got)
+	}
+	if _, ok := got["nvidia_cls_scrape_timestamp_seconds"]; ok {
+		t.Fatalf("failed cold start must not report a snapshot timestamp: %v", got)
+	}
+	if len(got) != 2 {
+		t.Fatalf("expected only health metrics, got %v", got)
+	}
 }
 
 func TestCollectorEntitlementMetricsPreserveChunks(t *testing.T) {

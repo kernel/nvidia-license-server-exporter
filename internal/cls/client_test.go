@@ -2,73 +2,550 @@ package cls
 
 import (
 	"bytes"
-	"compress/gzip"
 	"context"
-	"encoding/base64"
-	"encoding/json"
+	"fmt"
+	"log"
 	"net/http"
 	"net/http/httptest"
+	"strings"
+	"sync"
 	"testing"
 )
 
-func TestActiveLeasesResponseClientsCompressed(t *testing.T) {
-	resp := activeLeasesResponse{
-		CompressedClients: gzipBase64(t, `{"clients":[{"leases":[{"leaseId":"lease-1"}]},{"leases":[{"leaseId":"lease-2"}]}]}`),
-	}
+// Fixtures follow the field names of the published NVIDIA Licensing Service
+// OpenAPI document for the supported listing endpoints.
+const (
+	virtualGroupsBody = `{"virtualGroups":[{"id":42,"name":"DEFAULT_VG","entitlements":[{"emsEntitlementId":"ent-1","entitlementProductKeys":[{"emsProductKeyId":"pk-1","entitlementFeatures":[{"featureName":"NVIDIA RTX Virtual Workstation","featureVersion":"1.0","productName":"NVIDIA RTX Virtual Workstation","licenseType":"CONCURRENT_COUNTED_SINGLE","totalQuantity":200,"inUseQuantity":200,"unassignedQuantity":0}]}]}]}]}`
 
-	clients, err := resp.decodeClients()
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
+	allocationsPage0 = `{"allocations":[{"id":"alloc-1","type":"NVIDIA","name":"vgpu-license-server-0","status":"ENABLED","deployedOn":"CLOUD","leasingMode":"STANDARD","serviceInstanceId":"si-1","allocationFeatures":[{"id":"af-1","featureName":"NVIDIA RTX Virtual Workstation","productName":"NVIDIA RTX Virtual Workstation","licenseType":"CONCURRENT_COUNTED_SINGLE","totalQuantity":200}]}],"paginationInfo":{"index":0,"size":1,"totalResults":2,"totalPages":2}}`
+	allocationsPage1 = `{"allocations":[{"id":"alloc-2","type":"NVIDIA","name":"not-deployed","status":"DISABLED","virtualGroupId":42,"virtualGroupName":"DEFAULT_VG","deployedOn":"NOT_DEPLOYED","allocationFeatures":[]}],"paginationInfo":{"index":1,"size":1,"totalResults":2,"totalPages":2}}`
+
+	leasesPage0 = `{"clients":[{"hostname":"browser-a","leases":[{"leaseId":"lease-1","featureName":"NVIDIA RTX Virtual Workstation","licenseAllotmentFeatureId":"af-1"},{"leaseId":"lease-2","featureName":"NVIDIA RTX Virtual Workstation","licenseAllotmentFeatureId":"af-1"}]}],"paginationInfo":{"index":0,"size":2,"totalResults":4,"totalPages":2}}`
+	leasesPage1 = `{"clients":[{"hostname":"browser-b","leases":[{"leaseId":"lease-2","featureName":"NVIDIA RTX Virtual Workstation","licenseAllotmentFeatureId":"af-1"},{"leaseId":"lease-3","featureName":"Unmapped Feature","licenseAllotmentFeatureId":"af-missing"}]}],"paginationInfo":{"index":1,"size":2,"totalResults":4,"totalPages":2}}`
+)
+
+type fakeCLS struct {
+	mu       sync.Mutex
+	requests []*http.Request
+	// leases serves the active leases of one service instance per page, keyed
+	// by service instance ID; service instances without an entry answer 404.
+	leases map[string][]string
+	// allocationPages overrides the default two allocation pages.
+	allocationPages []string
+	// virtualGroupPages overrides the default single virtual-group page.
+	virtualGroupPages []string
+	// forbidden answers every request with a 403 that echoes the API key.
+	forbidden bool
+}
+
+func (f *fakeCLS) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	f.mu.Lock()
+	f.requests = append(f.requests, r.Clone(context.Background()))
+	f.mu.Unlock()
+
+	if r.Header.Get("x-api-key") != "test-key" {
+		http.Error(w, fmt.Sprintf(`{"message":"Invalid api-key %s"}`, r.Header.Get("x-api-key")), http.StatusUnauthorized)
+		return
 	}
-	if len(clients) != 2 || clients[0].Leases[0].LeaseID != "lease-1" || clients[1].Leases[0].LeaseID != "lease-2" {
-		t.Fatalf("unexpected clients: %+v", clients)
+	if f.forbidden {
+		http.Error(w, fmt.Sprintf(`{"message":"api-key %s is not authorized"}`, r.Header.Get("x-api-key")), http.StatusForbidden)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	switch r.URL.Path {
+	case "/v1/org/lic-test/virtual-groups":
+		pages := f.virtualGroupPages
+		if pages == nil {
+			pages = []string{virtualGroupsBody}
+		}
+		_, _ = w.Write([]byte(pages[pageIndex(r.URL.Query().Get("page-number"), len(pages))]))
+	case "/v1/org/lic-test/virtual-groups/43/allocations":
+		_, _ = w.Write([]byte(`{"allocations":[],"paginationInfo":{"index":0,"totalPages":1}}`))
+	case "/v1/org/lic-test/virtual-groups/42/allocations":
+		pages := f.allocationPages
+		if pages == nil {
+			pages = []string{allocationsPage0, allocationsPage1}
+		}
+		_, _ = w.Write([]byte(pages[pageIndex(r.URL.Query().Get("page-number"), len(pages))]))
+	case "/v1/org/lic-test/virtual-groups/42/leases":
+		pages, ok := f.leases[r.Header.Get("x-nv-service-instance-id")]
+		if !ok {
+			http.Error(w, `{"message":"Service instance or license server was not found in the system."}`, http.StatusNotFound)
+			return
+		}
+		_, _ = w.Write([]byte(pages[pageIndex(r.URL.Query().Get("page_number"), len(pages))]))
+	default:
+		http.Error(w, `{"message":"This API is no longer supported."}`, http.StatusBadRequest)
 	}
 }
 
-func TestActiveLeasesResponseClientsBadBase64(t *testing.T) {
-	resp := activeLeasesResponse{CompressedClients: "not-base64!!"}
-	if _, err := resp.decodeClients(); err == nil {
-		t.Fatal("expected error for invalid base64")
+func pageIndex(raw string, pages int) int {
+	var page int
+	_, _ = fmt.Sscanf(raw, "%d", &page)
+	if page >= pages {
+		return pages - 1
 	}
+	return page
 }
 
-func TestListActiveLeasesHTTPContract(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet {
-			t.Errorf("method: got %s, want GET", r.Method)
-		}
-		if r.URL.Path != "/v1/org/lic-test/virtual-groups/42/leases/all" {
-			t.Errorf("path: got %s", r.URL.Path)
-		}
-		if got := r.Header.Get("x-nv-service-instance-id"); got != "instance-1" {
-			t.Errorf("x-nv-service-instance-id: got %q, want %q", got, "instance-1")
-		}
-		if got := r.Header.Get("x-api-key"); got != "test-key" {
-			t.Errorf("x-api-key: got %q, want %q", got, "test-key")
-		}
-		resp := activeLeasesResponse{Clients: []activeLeaseClient{{Leases: []activeLease{{LeaseID: "lease-1"}}}}}
-		if err := json.NewEncoder(w).Encode(resp); err != nil {
-			t.Errorf("encode response: %v", err)
-		}
-	}))
-	defer server.Close()
+func (f *fakeCLS) paths() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	paths := make([]string, 0, len(f.requests))
+	for _, r := range f.requests {
+		paths = append(paths, r.URL.RequestURI())
+	}
+	return paths
+}
 
-	client, err := NewClient(Config{
-		BaseURL:    server.URL,
-		APIKey:     "test-key",
-		OrgName:    "lic-test",
-		HTTPClient: server.Client(),
-	})
+func newTestClient(t *testing.T, fake *fakeCLS, cfg Config) *Client {
+	t.Helper()
+	server := httptest.NewServer(fake)
+	t.Cleanup(server.Close)
+	cfg.BaseURL = server.URL
+	cfg.HTTPClient = server.Client()
+	if cfg.APIKey == "" {
+		cfg.APIKey = "test-key"
+	}
+	if cfg.OrgName == "" {
+		cfg.OrgName = "lic-test"
+	}
+	client, err := NewClient(cfg)
 	if err != nil {
 		t.Fatalf("create client: %v", err)
 	}
+	return client
+}
 
-	clients, err := client.listActiveLeases(context.Background(), 42, "instance-1")
+func TestFetchSnapshotUsesSupportedEndpoints(t *testing.T) {
+	fake := &fakeCLS{leases: map[string][]string{"si-1": {leasesPage0, leasesPage1}}}
+	client := newTestClient(t, fake, Config{ServiceInstanceID: "si-default"})
+
+	snap, err := client.FetchSnapshot(context.Background())
 	if err != nil {
-		t.Fatalf("list active leases: %v", err)
+		t.Fatalf("fetch snapshot: %v", err)
 	}
-	if len(clients) != 1 || len(clients[0].Leases) != 1 || clients[0].Leases[0].LeaseID != "lease-1" {
-		t.Fatalf("unexpected clients: %+v", clients)
+
+	for _, path := range fake.paths() {
+		for _, retired := range []string{"license-pools", "license-servers", "leases/all"} {
+			if strings.Contains(path, retired) {
+				t.Fatalf("request to retired endpoint: %s", path)
+			}
+		}
+	}
+	wantPaths := []string{
+		"/v1/org/lic-test/virtual-groups?page-number=0",
+		"/v1/org/lic-test/virtual-groups/42/allocations?page-number=0",
+		"/v1/org/lic-test/virtual-groups/42/allocations?page-number=1",
+		"/v1/org/lic-test/virtual-groups/42/leases?page_number=0",
+		"/v1/org/lic-test/virtual-groups/42/leases?page_number=1",
+	}
+	if got := fake.paths(); strings.Join(got, "\n") != strings.Join(wantPaths, "\n") {
+		t.Fatalf("requests = %v, want %v", got, wantPaths)
+	}
+	for _, r := range fake.requests {
+		if r.URL.Path == "/v1/org/lic-test/virtual-groups/42/leases" && r.Header.Get("x-nv-service-instance-id") != "si-1" {
+			t.Fatalf("lease request service instance = %q, want si-1", r.Header.Get("x-nv-service-instance-id"))
+		}
+	}
+
+	if len(snap.EntitlementFeatures) != 1 || snap.EntitlementFeatures[0].TotalQuantity != 200 {
+		t.Fatalf("unexpected entitlement features: %+v", snap.EntitlementFeatures)
+	}
+
+	info := make(map[string]ServerInfoSnapshot, len(snap.ServerInfo))
+	for _, item := range snap.ServerInfo {
+		info[item.ServerID] = item
+	}
+	wantInfo := map[string]ServerInfoSnapshot{
+		"alloc-1": {VirtualGroupID: 42, VirtualGroupName: "DEFAULT_VG", ServerID: "alloc-1", ServerName: "vgpu-license-server-0", ServerStatus: "ENABLED", DeployedOn: "CLOUD", LeasingMode: "STANDARD"},
+		"alloc-2": {VirtualGroupID: 42, VirtualGroupName: "DEFAULT_VG", ServerID: "alloc-2", ServerName: "not-deployed", ServerStatus: "DISABLED", DeployedOn: "NOT_DEPLOYED"},
+	}
+	if len(info) != len(wantInfo) {
+		t.Fatalf("server info = %+v, want %+v", info, wantInfo)
+	}
+	for id, want := range wantInfo {
+		if info[id] != want {
+			t.Fatalf("server info %s = %+v, want %+v", id, info[id], want)
+		}
+	}
+
+	if len(snap.ServerFeatureCapacity) != 1 {
+		t.Fatalf("server feature capacity = %+v, want one feature", snap.ServerFeatureCapacity)
+	}
+	if got := snap.ServerFeatureCapacity[0]; got.ServerID != "alloc-1" || got.VirtualGroupID != 42 || got.FeatureName != "NVIDIA RTX Virtual Workstation" || got.TotalQuantity != 200 {
+		t.Fatalf("unexpected server feature capacity: %+v", got)
+	}
+
+	active := make(map[string]ServerFeatureActiveLeaseSnapshot, len(snap.ServerFeatureActiveLeases))
+	for _, item := range snap.ServerFeatureActiveLeases {
+		active[item.FeatureName] = item
+	}
+	wantActive := map[string]ServerFeatureActiveLeaseSnapshot{
+		"NVIDIA RTX Virtual Workstation": {VirtualGroupID: 42, VirtualGroupName: "DEFAULT_VG", ServerID: "alloc-1", ServerName: "vgpu-license-server-0", FeatureName: "NVIDIA RTX Virtual Workstation", ProductName: "NVIDIA RTX Virtual Workstation", LicenseType: "CONCURRENT_COUNTED_SINGLE", ActiveLeases: 2},
+		"Unmapped Feature":               {VirtualGroupID: 42, VirtualGroupName: "DEFAULT_VG", ServerID: "alloc-1", ServerName: "vgpu-license-server-0", FeatureName: "Unmapped Feature", ProductName: "unknown", LicenseType: "unknown", ActiveLeases: 1},
+	}
+	if len(active) != len(wantActive) {
+		t.Fatalf("active leases = %+v, want %+v", active, wantActive)
+	}
+	for name, want := range wantActive {
+		if active[name] != want {
+			t.Fatalf("active leases %s = %+v, want %+v", name, active[name], want)
+		}
+	}
+}
+
+func TestFetchSnapshotUsesConfiguredServiceInstanceFallback(t *testing.T) {
+	fake := &fakeCLS{
+		allocationPages: []string{`{"allocations":[{"id":"alloc-1","type":"NVIDIA","deployedOn":"CLOUD","allocationFeatures":[]}],"paginationInfo":{"index":0,"totalPages":1}}`},
+		leases:          map[string][]string{"si-default": {`{"clients":[],"paginationInfo":{"index":0,"size":0,"totalResults":0,"totalPages":0}}`}},
+	}
+	client := newTestClient(t, fake, Config{ServiceInstanceID: "si-default"})
+
+	if _, err := client.FetchSnapshot(context.Background()); err != nil {
+		t.Fatalf("fetch snapshot: %v", err)
+	}
+	var leaseRequests int
+	for _, r := range fake.requests {
+		if r.URL.Path != "/v1/org/lic-test/virtual-groups/42/leases" {
+			continue
+		}
+		leaseRequests++
+		if got := r.Header.Get("x-nv-service-instance-id"); got != "si-default" {
+			t.Fatalf("lease request service instance = %q, want si-default", got)
+		}
+	}
+	if leaseRequests != 1 {
+		t.Fatalf("lease requests = %d, want 1", leaseRequests)
+	}
+}
+
+func TestFetchSnapshotSkipsNonCLSLeases(t *testing.T) {
+	for _, tc := range []struct {
+		name              string
+		allocationType    string
+		deployedOn        string
+		serviceInstanceID string
+		artifactType      string
+	}{
+		{name: "undeployed", allocationType: "NVIDIA", deployedOn: "NOT_DEPLOYED"},
+		{name: "not applicable", allocationType: "NVIDIA", deployedOn: "NOT_APPLICABLE"},
+		{name: "on premises", allocationType: "NVIDIA", deployedOn: "ON_PREM", serviceInstanceID: "si-dls"},
+		{name: "mellanox", allocationType: "MELLANOX"},
+		{name: "bright", allocationType: "BRIGHT"},
+		{name: "flexera", allocationType: "FLEXERA", deployedOn: "CLOUD", serviceInstanceID: "si-legacy"},
+		{name: "network license file", allocationType: "NVIDIA", artifactType: "NETWORK_LICENSE_FILE"},
+		{name: "node-locked license file", allocationType: "NVIDIA", artifactType: "NLL_FILE"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fake := &fakeCLS{allocationPages: []string{fmt.Sprintf(`{"allocations":[{"id":"alloc-2","type":%q,"deployedOn":%q,"serviceInstanceId":%q,"artifactType":%q,"allocationFeatures":[{"id":"af-1","featureName":"Feature","productName":"Product","licenseType":"CONCURRENT_COUNTED_SINGLE","totalQuantity":10}]}],"paginationInfo":{"totalPages":1}}`, tc.allocationType, tc.deployedOn, tc.serviceInstanceID, tc.artifactType)}}
+			client := newTestClient(t, fake, Config{ServiceInstanceID: "si-default"})
+
+			snap, err := client.FetchSnapshot(context.Background())
+			if err != nil {
+				t.Fatalf("fetch snapshot: %v", err)
+			}
+			if len(snap.ServerInfo) != 1 || len(snap.ServerFeatureCapacity) != 1 || snap.ServerFeatureCapacity[0].TotalQuantity != 10 {
+				t.Fatalf("expected allocation metadata and capacity to be preserved, got %+v", snap)
+			}
+			if len(snap.ServerFeatureActiveLeases) != 0 {
+				t.Fatalf("unexpected active leases: %+v", snap.ServerFeatureActiveLeases)
+			}
+			if paths := fake.paths(); len(paths) != 2 {
+				t.Fatalf("expected only virtual-group and allocation requests, got %v", paths)
+			}
+		})
+	}
+}
+
+func TestFetchSnapshotUsesBoundServiceInstanceOfArtifactAllocation(t *testing.T) {
+	fake := &fakeCLS{
+		allocationPages: []string{`{"allocations":[{"id":"alloc-1","type":"NVIDIA","artifactType":"LEGACY_CLOUD_NLL_FILE","serviceInstanceId":"si-bound","allocationFeatures":[]}],"paginationInfo":{"index":0,"totalPages":1}}`},
+		leases:          map[string][]string{"si-bound": {`{"clients":[],"paginationInfo":{"index":0,"totalPages":1}}`}},
+	}
+	client := newTestClient(t, fake, Config{ServiceInstanceID: "si-default"})
+
+	if _, err := client.FetchSnapshot(context.Background()); err != nil {
+		t.Fatalf("fetch snapshot: %v", err)
+	}
+	var leaseRequests int
+	for _, r := range fake.requests {
+		if r.URL.Path != "/v1/org/lic-test/virtual-groups/42/leases" {
+			continue
+		}
+		leaseRequests++
+		if got := r.Header.Get("x-nv-service-instance-id"); got != "si-bound" {
+			t.Fatalf("lease request service instance = %q, want si-bound", got)
+		}
+	}
+	if leaseRequests != 1 {
+		t.Fatalf("lease requests = %d, want 1", leaseRequests)
+	}
+}
+
+func TestFetchSnapshotPaginatesVirtualGroups(t *testing.T) {
+	fake := &fakeCLS{
+		virtualGroupPages: []string{
+			`{"virtualGroups":[{"id":42,"name":"DEFAULT_VG","entitlements":[{"emsEntitlementId":"ent-1","entitlementProductKeys":[{"emsProductKeyId":"pk-1","entitlementFeatures":[{"featureName":"Feature A","totalQuantity":10}]}]}]}],"paginationInfo":{"index":0,"totalPages":2}}`,
+			`{"virtualGroups":[{"id":42,"name":"DEFAULT_VG"},{"id":43,"name":"SECOND_VG","entitlements":[{"emsEntitlementId":"ent-2","entitlementProductKeys":[{"emsProductKeyId":"pk-2","entitlementFeatures":[{"featureName":"Feature B","totalQuantity":20}]}]}]}],"paginationInfo":{"index":1,"totalPages":2}}`,
+		},
+		allocationPages: []string{`{"allocations":[],"paginationInfo":{"index":0,"totalPages":1}}`},
+	}
+	client := newTestClient(t, fake, Config{})
+
+	snap, err := client.FetchSnapshot(context.Background())
+	if err != nil {
+		t.Fatalf("fetch snapshot: %v", err)
+	}
+	got := make(map[int]float64, len(snap.EntitlementFeatures))
+	for _, feature := range snap.EntitlementFeatures {
+		got[feature.VirtualGroupID] += feature.TotalQuantity
+	}
+	if len(snap.EntitlementFeatures) != 2 || got[42] != 10 || got[43] != 20 {
+		t.Fatalf("entitlement features = %+v, want one per virtual group", snap.EntitlementFeatures)
+	}
+}
+
+func TestFetchSnapshotLabelsMappedLeasesWithAllocationFeatureName(t *testing.T) {
+	fake := &fakeCLS{
+		allocationPages: []string{`{"allocations":[{"id":"alloc-1","type":"NVIDIA","deployedOn":"CLOUD","serviceInstanceId":"si-1","allocationFeatures":[{"id":"af-1","featureName":"NVIDIA RTX Virtual Workstation","productName":"Product","licenseType":"CONCURRENT_COUNTED_SINGLE","totalQuantity":10}]}],"paginationInfo":{"index":0,"totalPages":1}}`},
+		leases:          map[string][]string{"si-1": {`{"clients":[{"leases":[{"leaseId":"lease-1","featureName":"Quadro-Virtual-DWS","licenseAllotmentFeatureId":"af-1"},{"leaseId":"lease-2","featureName":"Unmapped Feature","licenseAllotmentFeatureId":"af-missing"}]}],"paginationInfo":{"index":0,"totalPages":1}}`}},
+	}
+	client := newTestClient(t, fake, Config{})
+
+	snap, err := client.FetchSnapshot(context.Background())
+	if err != nil {
+		t.Fatalf("fetch snapshot: %v", err)
+	}
+	names := make(map[string]float64, len(snap.ServerFeatureActiveLeases))
+	for _, item := range snap.ServerFeatureActiveLeases {
+		names[item.FeatureName] = item.ActiveLeases
+	}
+	if len(names) != 2 || names["NVIDIA RTX Virtual Workstation"] != 1 || names["Unmapped Feature"] != 1 {
+		t.Fatalf("active lease feature names = %v, want the allocation feature name for mapped leases", names)
+	}
+}
+
+func TestFetchSnapshotErrorIncludesResponseBody(t *testing.T) {
+	fake := &fakeCLS{allocationPages: []string{`{"allocations":[{"id":"alloc-1","serviceInstanceId":"si-1"}],"paginationInfo":{"totalPages":1}}`}}
+	client := newTestClient(t, fake, Config{})
+
+	snap, err := client.FetchSnapshot(context.Background())
+	if snap != nil || err == nil {
+		t.Fatalf("expected failed snapshot, got snapshot=%v err=%v", snap, err)
+	}
+	for _, want := range []string{"service-instance si-1", "failed with status 404", "not found in the system"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("error %q does not mention %q", err, want)
+		}
+	}
+}
+
+func TestFetchSnapshotUnauthorizedErrorDoesNotExposeAPIKey(t *testing.T) {
+	const apiKey = "invalid-test-key"
+	client := newTestClient(t, &fakeCLS{}, Config{APIKey: apiKey})
+
+	snap, err := client.FetchSnapshot(context.Background())
+	if snap != nil || err == nil {
+		t.Fatalf("expected failed snapshot, got snapshot=%v err=%v", snap, err)
+	}
+	if !strings.Contains(err.Error(), "failed with status 401") {
+		t.Fatalf("expected unauthorized error, got %v", err)
+	}
+	if strings.Contains(err.Error(), apiKey) {
+		t.Fatal("unauthorized error exposes the API key")
+	}
+}
+
+func TestFetchSnapshotErrorRedactsAPIKey(t *testing.T) {
+	client := newTestClient(t, &fakeCLS{forbidden: true}, Config{})
+
+	_, err := client.FetchSnapshot(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "failed with status 403") {
+		t.Fatalf("expected forbidden error, got %v", err)
+	}
+	if strings.Contains(err.Error(), "test-key") {
+		t.Fatal("forbidden error exposes the API key")
+	}
+	if !strings.Contains(err.Error(), "api-key ******** is not authorized") {
+		t.Fatalf("expected redacted response body, got %v", err)
+	}
+}
+
+func TestFetchSnapshotRejectsRunawayListing(t *testing.T) {
+	fake := &fakeCLS{allocationPages: []string{fmt.Sprintf(`{"allocations":[],"paginationInfo":{"index":0,"totalPages":%d}}`, maxPages+1)}}
+	client := newTestClient(t, fake, Config{})
+
+	_, err := client.FetchSnapshot(context.Background())
+	if err == nil || !strings.Contains(err.Error(), fmt.Sprintf("exceeded %d pages", maxPages)) {
+		t.Fatalf("expected page cap error, got %v", err)
+	}
+	if got := len(fake.paths()); got != maxPages+1 {
+		t.Fatalf("requests = %d, want %d", got, maxPages+1)
+	}
+}
+
+func TestFetchSnapshotRejectsRepeatedLeasePage(t *testing.T) {
+	// A listing that ignores page_number answers every page with the first one.
+	fake := &fakeCLS{
+		allocationPages: []string{`{"allocations":[{"id":"alloc-1","type":"NVIDIA","deployedOn":"CLOUD","serviceInstanceId":"si-1","allocationFeatures":[]}],"paginationInfo":{"index":0,"totalPages":1}}`},
+		leases:          map[string][]string{"si-1": {`{"clients":[{"leases":[{"leaseId":"lease-1"},{"leaseId":"lease-2"}]}],"paginationInfo":{"index":0,"size":2,"totalResults":4,"totalPages":2}}`}},
+	}
+	client := newTestClient(t, fake, Config{})
+
+	snap, err := client.FetchSnapshot(context.Background())
+	if snap != nil || err == nil {
+		t.Fatalf("expected failed snapshot, got snapshot=%v err=%v", snap, err)
+	}
+	for _, want := range []string{"service-instance si-1", "page 1 of the listing only repeated earlier results"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("error %q does not mention %q", err, want)
+		}
+	}
+}
+
+func captureLogs(t *testing.T) *bytes.Buffer {
+	t.Helper()
+	var logs bytes.Buffer
+	previous := log.Writer()
+	log.SetOutput(&logs)
+	t.Cleanup(func() { log.SetOutput(previous) })
+	return &logs
+}
+
+func TestFetchSnapshotCountsLeasesOfSharedServiceInstanceOnce(t *testing.T) {
+	logs := captureLogs(t)
+
+	fake := &fakeCLS{
+		allocationPages: []string{`{"allocations":[{"id":"alloc-1","type":"NVIDIA","name":"server-1","deployedOn":"CLOUD","serviceInstanceId":"si-1","allocationFeatures":[{"id":"af-1","featureName":"Feature","productName":"Product A","licenseType":"CONCURRENT_COUNTED_SINGLE","totalQuantity":10}]},{"id":"alloc-2","type":"NVIDIA","name":"server-2","deployedOn":"CLOUD","serviceInstanceId":"si-1","allocationFeatures":[{"id":"af-2","featureName":"Feature","productName":"Product B","licenseType":"CONCURRENT_COUNTED_SINGLE","totalQuantity":10}]}],"paginationInfo":{"index":0,"totalPages":1}}`},
+		leases:          map[string][]string{"si-1": {`{"clients":[{"leases":[{"leaseId":"lease-1","featureName":"Feature","licenseAllotmentFeatureId":"af-1"},{"leaseId":"lease-2","featureName":"Feature","licenseAllotmentFeatureId":"af-2"},{"leaseId":"lease-3","featureName":"Feature","licenseAllotmentFeatureId":"af-missing"}]}],"paginationInfo":{"index":0,"totalPages":1}}`}},
+	}
+	client := newTestClient(t, fake, Config{})
+
+	snap, err := client.FetchSnapshot(context.Background())
+	if err != nil {
+		t.Fatalf("fetch snapshot: %v", err)
+	}
+	var leaseRequests int
+	for _, path := range fake.paths() {
+		if strings.Contains(path, "/leases") {
+			leaseRequests++
+		}
+	}
+	if leaseRequests != 1 {
+		t.Fatalf("lease requests = %d, want one for the shared service instance", leaseRequests)
+	}
+	got := make(map[string]float64, len(snap.ServerFeatureActiveLeases))
+	for _, item := range snap.ServerFeatureActiveLeases {
+		if item.VirtualGroupID != 42 || item.VirtualGroupName != "DEFAULT_VG" {
+			t.Fatalf("unexpected virtual group: %+v", item)
+		}
+		got[item.ServerName+"/"+item.ProductName] = item.ActiveLeases
+	}
+	want := map[string]float64{"server-1/Product A": 1, "server-2/Product B": 1, "/unknown": 1}
+	if len(got) != len(want) {
+		t.Fatalf("active leases = %v, want %v", got, want)
+	}
+	for key, count := range want {
+		if got[key] != count {
+			t.Fatalf("active leases = %v, want %v", got, want)
+		}
+	}
+	if notice := "1 of 3 active leases for service-instance si-1 in virtual-group 42 match no allocation feature"; !strings.Contains(logs.String(), notice) {
+		t.Fatalf("logs = %q, want %q", logs.String(), notice)
+	}
+}
+
+func TestActiveLeasesCountsLeaseListedInTwoVirtualGroupsOnce(t *testing.T) {
+	// A listing that ignores its virtual group answers with every lease of the
+	// service instance.
+	owner := allocation{ID: "alloc-1", Name: "server-1", VirtualGroupID: 42, VirtualGroupName: "DEFAULT_VG", AllocationFeatures: []allocationFeature{{ID: "af-1", FeatureName: "Feature", ProductName: "Product", LicenseType: "CONCURRENT_COUNTED_SINGLE"}}}
+	other := allocation{ID: "alloc-2", Name: "server-2", VirtualGroupID: 43, VirtualGroupName: "SECOND_VG"}
+	listed := []lease{{LeaseID: "lease-1", LicenseAllotmentFeatureID: "af-1"}}
+	first := leaseListing{virtualGroupID: 42, serviceInstanceID: "si-1"}
+	second := leaseListing{virtualGroupID: 43, serviceInstanceID: "si-1"}
+
+	got := activeLeases(
+		[]allocation{owner, other},
+		map[leaseListing][]allocation{first: {owner}, second: {other}},
+		map[leaseListing][]lease{first: listed, second: listed},
+	)
+	want := ServerFeatureActiveLeaseSnapshot{VirtualGroupID: 42, VirtualGroupName: "DEFAULT_VG", ServerID: "alloc-1", ServerName: "server-1", FeatureName: "Feature", ProductName: "Product", LicenseType: "CONCURRENT_COUNTED_SINGLE", ActiveLeases: 1}
+	if len(got) != 1 || got[0] != want {
+		t.Fatalf("active leases = %+v, want %+v", got, want)
+	}
+}
+
+func TestActiveLeasesDoesNotMatchFeaturesWithoutID(t *testing.T) {
+	a := allocation{ID: "alloc-1", VirtualGroupID: 42, AllocationFeatures: []allocationFeature{{FeatureName: "Feature", ProductName: "Product"}}}
+	listing := leaseListing{virtualGroupID: 42, serviceInstanceID: "si-1"}
+
+	got := activeLeases(
+		[]allocation{a},
+		map[leaseListing][]allocation{listing: {a}},
+		map[leaseListing][]lease{listing: {{LeaseID: "lease-1", FeatureName: "Leased Feature"}}},
+	)
+	if len(got) != 1 || got[0].ServerID != "alloc-1" || got[0].FeatureName != "Leased Feature" || got[0].ProductName != "unknown" {
+		t.Fatalf("active leases = %+v, want one unmatched lease on alloc-1", got)
+	}
+}
+
+func TestFetchSnapshotLogsCloudAllocationWithoutServiceInstance(t *testing.T) {
+	logs := captureLogs(t)
+
+	fake := &fakeCLS{allocationPages: []string{`{"allocations":[{"id":"alloc-unbound","type":"NVIDIA","deployedOn":"CLOUD","allocationFeatures":[{"id":"af-1","featureName":"Feature","productName":"Product","licenseType":"CONCURRENT_COUNTED_SINGLE","totalQuantity":10}]},{"id":"alloc-license-file","type":"NVIDIA","artifactType":"NLL_FILE","allocationFeatures":[]}],"paginationInfo":{"index":0,"totalPages":1}}`}}
+	client := newTestClient(t, fake, Config{})
+
+	snap, err := client.FetchSnapshot(context.Background())
+	if err != nil {
+		t.Fatalf("fetch snapshot: %v", err)
+	}
+	if len(snap.ServerInfo) != 2 || len(snap.ServerFeatureCapacity) != 1 || len(snap.ServerFeatureActiveLeases) != 0 {
+		t.Fatalf("expected metadata and capacity without active leases, got %+v", snap)
+	}
+	if paths := fake.paths(); len(paths) != 2 {
+		t.Fatalf("expected only virtual-group and allocation requests, got %v", paths)
+	}
+	if got := logs.String(); !strings.Contains(got, "skipping active leases for allocation alloc-unbound") || strings.Contains(got, "alloc-license-file") {
+		t.Fatalf("logs = %q, want a skip notice for alloc-unbound only", got)
+	}
+}
+
+func TestErrorBody(t *testing.T) {
+	if got := errorBody(strings.NewReader(""), "secret"); got != "empty response body" {
+		t.Fatalf("empty body = %q", got)
+	}
+	if got := errorBody(strings.NewReader("{\n  \"message\":\t\"This API is no longer supported.\"\n}\n"), "secret"); got != `{ "message": "This API is no longer supported." }` {
+		t.Fatalf("collapsed body = %q", got)
+	}
+	if got := errorBody(strings.NewReader(strings.Repeat("x", 2*maxErrorBodyBytes)), "secret"); len(got) != maxErrorBodyBytes {
+		t.Fatalf("bounded body length = %d, want %d", len(got), maxErrorBodyBytes)
+	}
+	const key = "0123456789abcdef"
+	for offset := maxErrorBodyBytes - len(key); offset <= maxErrorBodyBytes; offset++ {
+		got := errorBody(strings.NewReader(strings.Repeat("x", offset)+key+strings.Repeat("y", maxErrorBodyBytes)), key)
+		if strings.Contains(got, key[:4]) {
+			t.Fatalf("excerpt with key at offset %d exposes part of it: %q", offset, got)
+		}
+	}
+}
+
+func TestErrorBodyRedactsRepeatedKeysAtReadBoundary(t *testing.T) {
+	const key = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+	for _, echoes := range []int{1, 4} {
+		prefix := strings.Repeat(key+" ", echoes)
+		for offset := maxErrorBodyBytes + 1; offset < maxErrorBodyBytes+len(key); offset++ {
+			t.Run(fmt.Sprintf("echoes=%d/offset=%d", echoes, offset), func(t *testing.T) {
+				body := prefix + strings.Repeat("x", offset-len(prefix)) + key
+				got := errorBody(strings.NewReader(body), key)
+				if strings.Contains(got, key[:1]) {
+					t.Fatalf("excerpt exposes part of the trailing key: %q", got)
+				}
+				if len(got) > maxErrorBodyBytes {
+					t.Fatalf("excerpt length = %d, want at most %d", len(got), maxErrorBodyBytes)
+				}
+			})
+		}
 	}
 }
 
@@ -109,18 +586,4 @@ func TestExtractEntitlementFeatureMetricsIDs(t *testing.T) {
 	if metrics[0].EMSEntitlementID != "ent-1" || metrics[1].EMSEntitlementID != "ent-1" {
 		t.Fatalf("unexpected entitlement ids: %+v", metrics)
 	}
-}
-
-func gzipBase64(t *testing.T, payload string) string {
-	t.Helper()
-
-	var buf bytes.Buffer
-	gz := gzip.NewWriter(&buf)
-	if _, err := gz.Write([]byte(payload)); err != nil {
-		t.Fatalf("gzip write: %v", err)
-	}
-	if err := gz.Close(); err != nil {
-		t.Fatalf("gzip close: %v", err)
-	}
-	return base64.StdEncoding.EncodeToString(buf.Bytes())
 }

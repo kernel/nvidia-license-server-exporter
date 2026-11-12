@@ -14,6 +14,24 @@ The exporter is intentionally scoped to CLS only (no DLS support).
 Optional:
 - Service instance ID (`x-nv-service-instance-id`) for environments that require it
 
+## NVIDIA API endpoints
+
+The exporter reads the supported listing endpoints of the NVIDIA Licensing Portal API:
+
+- `GET /v1/org/{org}/virtual-groups` (paginated) for entitlement features
+- `GET /v1/org/{org}/virtual-groups/{vg}/allocations` (paginated) for license servers and their features
+- `GET /v1/org/{org}/virtual-groups/{vg}/leases` (paginated, scoped by `X-NV-SERVICE-INSTANCE-ID`) for active leases, once per service instance in a virtual group
+
+Lease lookups skip allocations that are not NVIDIA License System allocations (network-license and legacy Flexera allocations) and explicitly non-cloud deployments, even when `NVIDIA_SERVICE_INSTANCE_ID` is configured. `NVIDIA_SERVICE_INSTANCE_ID` only fills in a missing binding for allocations without a generated license file. Their metadata and capacity are still exported.
+
+A cloud allocation that reports no service instance, with `NVIDIA_SERVICE_INSTANCE_ID` unset, is logged and exported without active leases.
+
+Each lease is counted once, under the allocation that owns the feature it was granted from. A lease whose feature no allocation lists is exported with `product_name` and `license_type` set to `unknown`, and the count is logged per listing. It is counted under the listing's allocation when there is only one, and under `server_id="unknown"` when the listing covers several.
+
+A page that only repeats earlier results fails the collection. NVIDIA's lease listing has returned at most 100 clients per response, so an ignored page parameter would otherwise cap the lease count without an error.
+
+NVIDIA retired `.../license-servers/{id}/license-pools` (it now answers HTTP 400 "This API is no longer supported") and deprecated `.../license-servers` in favor of allocations; neither is used.
+
 ## Configuration
 
 ### CLS and server
@@ -38,6 +56,7 @@ If `LISTEN_ADDRESS` is unset and `PORT` is set (for example on Railway), the exp
 - `OTEL_SERVICE_INSTANCE_ID` (optional, default hostname)
 - `OTEL_INSECURE` (optional, default `true`)
 - `OTEL_PUSH_INTERVAL` (optional, default `60s`)
+- `OTEL_RESOURCE_ATTRIBUTES` (optional, standard OpenTelemetry resource attributes such as `deployment.environment=production`)
 
 Flags are also available in `-kebab-case` (for example `-otel-enabled`, `-otel-endpoint`).
 
@@ -61,7 +80,10 @@ Prometheus pull and OTEL push use the same snapshot cache.
 
 - If cache is fresh (`CACHE_TTL`), no CLS API call is made.
 - If cache is stale, one refresh call updates cache for both pull and push.
-- If refresh fails and a stale snapshot exists, stale data is still emitted with `nvidia_cls_up=0`.
+- If refresh fails and a stale snapshot exists, stale data is still emitted with `nvidia_cls_up=0` and `nvidia_cls_scrape_timestamp_seconds` keeps the last successful collection time.
+- If refresh fails before any snapshot exists, `nvidia_cls_up=0` and `nvidia_cls_scrape_duration_seconds` are still emitted; the timestamp and data metrics appear once a snapshot is collected.
+
+`/healthz` only reports that the process serves HTTP. Alert on `nvidia_cls_up` for collection health.
 
 Recommended default:
 - `CACHE_TTL=60s`

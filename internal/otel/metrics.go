@@ -69,15 +69,9 @@ func NewMetricsPusher(ctx context.Context, cfg Config, orgName string, snapshotS
 		return nil, fmt.Errorf("otel service name is required")
 	}
 
-	res, err := resource.New(
-		ctx,
-		resource.WithAttributes(
-			semconv.ServiceNameKey.String(cfg.ServiceName),
-			semconv.ServiceInstanceIDKey.String(cfg.ServiceInstanceID),
-		),
-	)
+	res, err := newResource(ctx, cfg)
 	if err != nil {
-		return nil, fmt.Errorf("create otel resource: %w", err)
+		return nil, err
 	}
 
 	expOpts := []otlpmetricgrpc.Option{
@@ -117,6 +111,24 @@ func NewMetricsPusher(ctx context.Context, cfg Config, orgName string, snapshotS
 	}
 
 	return p, nil
+}
+
+// newResource honors OTEL_RESOURCE_ATTRIBUTES so deployments can label the
+// metrics, for example with deployment.environment; the configured service
+// identity takes precedence.
+func newResource(ctx context.Context, cfg Config) (*resource.Resource, error) {
+	res, err := resource.New(
+		ctx,
+		resource.WithFromEnv(),
+		resource.WithAttributes(
+			semconv.ServiceNameKey.String(cfg.ServiceName),
+			semconv.ServiceInstanceIDKey.String(cfg.ServiceInstanceID),
+		),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("create otel resource: %w", err)
+	}
+	return res, nil
 }
 
 func (p *MetricsPusher) Start() {
@@ -203,11 +215,7 @@ func (p *MetricsPusher) registerMetrics(meter metric.Meter) error {
 
 	_, err = meter.RegisterCallback(
 		func(_ context.Context, o metric.Observer) error {
-			snap, meta, ok := p.snapshotSvc.Latest()
-			if !ok {
-				return nil
-			}
-
+			snap, meta, _ := p.snapshotSvc.Latest()
 			for _, item := range buildObservations(p.orgName, snap, meta) {
 				switch item.name {
 				case metricUp:
@@ -298,15 +306,21 @@ func (e *loggingExporter) Shutdown(ctx context.Context) error {
 	return e.exporter.Shutdown(ctx)
 }
 
+// buildObservations always reports collection health. The data metrics need a
+// snapshot, and the snapshot timestamp is only reported once one has been
+// collected so a failing cold start does not look fresh.
 func buildObservations(orgName string, snap *cls.Snapshot, meta snapshot.Meta) []observation {
-	observations := make([]observation, 0, 3+3*len(snap.EntitlementFeatures)+len(snap.ServerFeatureCapacity)+len(snap.ServerFeatureActiveLeases)+len(snap.ServerUsage))
 	orgAttr := attribute.String("org_name", orgName)
-
-	observations = append(observations,
-		observation{name: metricUp, value: meta.Up, attrs: []attribute.KeyValue{orgAttr}},
-		observation{name: metricScrapeDuration, value: meta.DurationSeconds, attrs: []attribute.KeyValue{orgAttr}},
-		observation{name: metricScrapeTimestamp, value: float64(meta.Timestamp.Unix()), attrs: []attribute.KeyValue{orgAttr}},
-	)
+	observations := []observation{
+		{name: metricUp, value: meta.Up, attrs: []attribute.KeyValue{orgAttr}},
+		{name: metricScrapeDuration, value: meta.DurationSeconds, attrs: []attribute.KeyValue{orgAttr}},
+	}
+	if !meta.Timestamp.IsZero() {
+		observations = append(observations, observation{name: metricScrapeTimestamp, value: float64(meta.Timestamp.Unix()), attrs: []attribute.KeyValue{orgAttr}})
+	}
+	if snap == nil {
+		return observations
+	}
 
 	for _, item := range snap.EntitlementFeatures {
 		attrs := []attribute.KeyValue{
@@ -361,7 +375,7 @@ func buildObservations(orgName string, snap *cls.Snapshot, meta snapshot.Meta) [
 		})
 	}
 
-	for _, item := range snap.ServerUsage {
+	for _, item := range snap.ServerInfo {
 		observations = append(observations, observation{
 			name:  metricServerInfo,
 			value: 1,
