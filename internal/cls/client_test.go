@@ -1,8 +1,10 @@
 package cls
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -380,6 +382,49 @@ func TestFetchSnapshotRejectsRunawayListing(t *testing.T) {
 	}
 	if got := len(fake.paths()); got != maxPages+1 {
 		t.Fatalf("requests = %d, want %d", got, maxPages+1)
+	}
+}
+
+func TestFetchSnapshotRejectsRepeatedLeasePage(t *testing.T) {
+	// A listing that ignores page_number answers every page with the first one.
+	fake := &fakeCLS{
+		allocationPages: []string{`{"allocations":[{"id":"alloc-1","type":"NVIDIA","deployedOn":"CLOUD","serviceInstanceId":"si-1","allocationFeatures":[]}],"paginationInfo":{"index":0,"totalPages":1}}`},
+		leases:          map[string][]string{"alloc-1": {`{"clients":[{"leases":[{"leaseId":"lease-1"},{"leaseId":"lease-2"}]}],"paginationInfo":{"index":0,"size":2,"totalResults":4,"totalPages":2}}`}},
+	}
+	client := newTestClient(t, fake, Config{})
+
+	snap, err := client.FetchSnapshot(context.Background())
+	if snap != nil || err == nil {
+		t.Fatalf("expected failed snapshot, got snapshot=%v err=%v", snap, err)
+	}
+	for _, want := range []string{"allocation alloc-1", "page 1 of the listing only repeated earlier results"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("error %q does not mention %q", err, want)
+		}
+	}
+}
+
+func TestFetchSnapshotLogsCloudAllocationWithoutServiceInstance(t *testing.T) {
+	var logs bytes.Buffer
+	previous := log.Writer()
+	log.SetOutput(&logs)
+	t.Cleanup(func() { log.SetOutput(previous) })
+
+	fake := &fakeCLS{allocationPages: []string{`{"allocations":[{"id":"alloc-unbound","type":"NVIDIA","deployedOn":"CLOUD","allocationFeatures":[{"id":"af-1","featureName":"Feature","productName":"Product","licenseType":"CONCURRENT_COUNTED_SINGLE","totalQuantity":10}]},{"id":"alloc-license-file","type":"NVIDIA","artifactType":"NLL_FILE","allocationFeatures":[]}],"paginationInfo":{"index":0,"totalPages":1}}`}}
+	client := newTestClient(t, fake, Config{})
+
+	snap, err := client.FetchSnapshot(context.Background())
+	if err != nil {
+		t.Fatalf("fetch snapshot: %v", err)
+	}
+	if len(snap.ServerInfo) != 2 || len(snap.ServerFeatureCapacity) != 1 || len(snap.ServerFeatureActiveLeases) != 0 {
+		t.Fatalf("expected metadata and capacity without active leases, got %+v", snap)
+	}
+	if paths := fake.paths(); len(paths) != 2 {
+		t.Fatalf("expected only virtual-group and allocation requests, got %v", paths)
+	}
+	if got := logs.String(); !strings.Contains(got, "skipping active leases for allocation alloc-unbound") || strings.Contains(got, "alloc-license-file") {
+		t.Fatalf("logs = %q, want a skip notice for alloc-unbound only", got)
 	}
 }
 

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -223,14 +224,16 @@ func (c *Client) listVirtualGroups(ctx context.Context) ([]virtualGroup, error) 
 	err := listPages(ctx, c, func(page int) string {
 		query := url.Values{"page-number": {strconv.Itoa(page)}}
 		return base + "?" + query.Encode()
-	}, "", func(resp virtualGroupsResponse) {
+	}, "", func(resp virtualGroupsResponse) (items, fresh int) {
 		for _, vg := range resp.VirtualGroups {
 			if _, ok := seen[vg.ID]; ok {
 				continue
 			}
 			seen[vg.ID] = struct{}{}
 			virtualGroups = append(virtualGroups, vg)
+			fresh++
 		}
+		return len(resp.VirtualGroups), fresh
 	})
 	if err != nil {
 		return nil, err
@@ -247,7 +250,7 @@ func (c *Client) listAllocations(ctx context.Context, vg virtualGroup) ([]alloca
 	err := listPages(ctx, c, func(page int) string {
 		query := url.Values{"page-number": {strconv.Itoa(page)}}
 		return base + "?" + query.Encode()
-	}, "", func(resp allocationsResponse) {
+	}, "", func(resp allocationsResponse) (items, fresh int) {
 		for _, a := range resp.Allocations {
 			if _, ok := seen[a.ID]; ok {
 				continue
@@ -260,7 +263,9 @@ func (c *Client) listAllocations(ctx context.Context, vg virtualGroup) ([]alloca
 				a.VirtualGroupName = vg.Name
 			}
 			allocations = append(allocations, a)
+			fresh++
 		}
+		return len(resp.Allocations), fresh
 	})
 	if err != nil {
 		return nil, err
@@ -269,6 +274,7 @@ func (c *Client) listAllocations(ctx context.Context, vg virtualGroup) ([]alloca
 }
 
 // listAllocationLeases walks the paginated active leases of one CLS allocation.
+// A lease ID can repeat across pages, so each is returned once.
 // A configured service instance fills in missing binding metadata; it does not
 // override an allocation's type or deployment. NVIDIA omits the binding when a
 // license file has been generated for the allocation, so the fallback does not
@@ -285,9 +291,13 @@ func (c *Client) listAllocationLeases(ctx context.Context, a allocation) ([]leas
 		serviceInstanceID = c.serviceInstanceID
 	}
 	if serviceInstanceID == "" {
+		if a.ArtifactType == "" {
+			log.Printf("skipping active leases for allocation %s in virtual-group %d: no service instance is bound and NVIDIA_SERVICE_INSTANCE_ID is not set", a.ID, a.VirtualGroupID)
+		}
 		return nil, nil
 	}
 	base := fmt.Sprintf("%s/v1/org/%s/virtual-groups/%d/leases", c.baseURL, url.PathEscape(c.orgName), a.VirtualGroupID)
+	seen := make(map[string]struct{})
 	leases := make([]lease, 0)
 	err := listPages(ctx, c, func(page int) string {
 		query := url.Values{
@@ -295,10 +305,21 @@ func (c *Client) listAllocationLeases(ctx context.Context, a allocation) ([]leas
 			"page_number":        {strconv.Itoa(page)},
 		}
 		return base + "?" + query.Encode()
-	}, serviceInstanceID, func(resp leasesResponse) {
+	}, serviceInstanceID, func(resp leasesResponse) (items, fresh int) {
 		for _, client := range resp.Clients {
-			leases = append(leases, client.Leases...)
+			for _, l := range client.Leases {
+				items++
+				if leaseID := strings.TrimSpace(l.LeaseID); leaseID != "" {
+					if _, ok := seen[leaseID]; ok {
+						continue
+					}
+					seen[leaseID] = struct{}{}
+				}
+				leases = append(leases, l)
+				fresh++
+			}
 		}
+		return items, fresh
 	})
 	if err != nil {
 		return nil, err
@@ -311,9 +332,11 @@ type pagedResponse interface {
 }
 
 // listPages visits every page of a listing, in order, until the API reports
-// the last page. A listing that never ends is an error rather than a partial
-// snapshot presented as complete.
-func listPages[T pagedResponse](ctx context.Context, c *Client, pageURL func(page int) string, serviceInstanceID string, visit func(T)) error {
+// the last page. visit reports how many items the page held and how many of
+// them it had not seen before. A page that only repeats earlier items means
+// the API did not honor the page parameter; that and a listing that never ends
+// are errors rather than a partial snapshot presented as complete.
+func listPages[T pagedResponse](ctx context.Context, c *Client, pageURL func(page int) string, serviceInstanceID string, visit func(T) (items, fresh int)) error {
 	for page := 0; ; page++ {
 		if page >= maxPages {
 			return fmt.Errorf("listing exceeded %d pages", maxPages)
@@ -322,7 +345,9 @@ func listPages[T pagedResponse](ctx context.Context, c *Client, pageURL func(pag
 		if err := c.doJSON(ctx, http.MethodGet, pageURL(page), &resp, serviceInstanceID); err != nil {
 			return err
 		}
-		visit(resp)
+		if items, fresh := visit(resp); items > 0 && fresh == 0 {
+			return fmt.Errorf("page %d of the listing only repeated earlier results", page)
+		}
 		if page+1 >= resp.pagination().TotalPages {
 			return nil
 		}
@@ -491,25 +516,16 @@ type activeFeatureKey struct {
 	licenseType string
 }
 
-// featureActiveLeases counts leases per allocation feature. A lease ID can
-// repeat across pages, so each is counted once.
+// featureActiveLeases counts leases per allocation feature.
 func (a allocation) featureActiveLeases(leases []lease) []ServerFeatureActiveLeaseSnapshot {
 	featureByID := make(map[string]allocationFeature, len(a.AllocationFeatures))
 	for _, feature := range a.AllocationFeatures {
 		featureByID[feature.ID] = feature
 	}
 
-	seen := make(map[string]struct{}, len(leases))
 	counts := make(map[activeFeatureKey]float64)
 	order := make([]activeFeatureKey, 0)
 	for _, l := range leases {
-		leaseID := strings.TrimSpace(l.LeaseID)
-		if leaseID != "" {
-			if _, ok := seen[leaseID]; ok {
-				continue
-			}
-			seen[leaseID] = struct{}{}
-		}
 		feature := featureByID[l.LicenseAllotmentFeatureID]
 		key := activeFeatureKey{
 			featureName: firstNonEmptyNonBlank(feature.FeatureName, l.FeatureName, "unknown"),
