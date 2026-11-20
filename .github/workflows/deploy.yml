@@ -52,6 +52,7 @@ jobs:
           private-key: ${{ secrets.ADMIN_APP_PRIVATE_KEY }}
           owner: kernel
           repositories: kernel
+          permission-actions: write
 
       - name: Dispatch deploy in kernel/kernel
         env:
