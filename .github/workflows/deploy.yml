@@ -46,12 +46,13 @@ jobs:
 
       - name: Generate app token
         id: app-token
-        uses: actions/create-github-app-token@v1.12.0
+        uses: actions/create-github-app-token@v3.3.0
         with:
           app-id: ${{ secrets.ADMIN_APP_ID }}
           private-key: ${{ secrets.ADMIN_APP_PRIVATE_KEY }}
           owner: kernel
           repositories: kernel
+          permission-actions: write
 
       - name: Dispatch deploy in kernel/kernel
         env:
